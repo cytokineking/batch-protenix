@@ -1,0 +1,37 @@
+__pycache__/
+.DS_Store
+
+# Reference clone directories (not part of this repo)
+Protenix/
+MMseqs2/
+
+# Python bytecode/cache
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build/output artifacts
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# IDE/editor
+.idea/
+.vscode/
+
+# Development files
+runs/
+plans/
+*.csv
