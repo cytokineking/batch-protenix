@@ -19,6 +19,7 @@ import datetime
 import hashlib
 import importlib
 import json
+import os
 import queue
 import re
 import shutil
@@ -26,8 +27,9 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
@@ -176,6 +178,10 @@ def _coerce_bool(value: Any) -> bool:
     return bool(value)
 
 
+def _log(msg: str) -> None:
+    print(msg, flush=True)
+
+
 def _cache_mode_flags(cache_mode: str, store_alias: bool = False) -> Tuple[bool, bool]:
     mode = (cache_mode or "readwrite").strip().lower()
     read = mode in {"read", "readwrite"}
@@ -250,6 +256,119 @@ def _save_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{uuid.uuid4().hex}")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def _atomic_save_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{uuid.uuid4().hex}")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _dict_get(d: modal.Dict, key: str, default: Any = None) -> Any:
+    try:
+        return d[key]
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def _dict_pop(d: modal.Dict, key: str) -> Any:
+    val = _dict_get(d, key, None)
+    try:
+        del d[key]
+    except Exception:  # noqa: BLE001
+        pass
+    return val
+
+
+def _normalize_host_identity(host_url: str) -> str:
+    host = (host_url or "").strip().lower().rstrip("/")
+    return host
+
+
+def _msa_context_hash(
+    *,
+    mmseqs_mode: str,
+    mmseqs_host_url: str,
+    mmseqs_db_tag: str,
+    mmseqs_pairing_strategy: str,
+    context_schema_version: str = "msa_ctx_v1",
+) -> str:
+    payload = {
+        "context_schema_version": context_schema_version,
+        "mmseqs_mode": mmseqs_mode,
+        "mmseqs_host_url": _normalize_host_identity(mmseqs_host_url),
+        "mmseqs_db_tag": mmseqs_db_tag,
+        "mmseqs_pairing_strategy": mmseqs_pairing_strategy,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return _short_hash(canonical, n=24)
+
+
+def _msa_dependency_key(role: str, sequence: str, context_hash: str) -> str:
+    seq_hash = _short_hash(_normalize_sequence(sequence), n=24)
+    return f"msa:{role}:{seq_hash}:{context_hash}"
+
+
+def _parse_task_id(task_id: str) -> Tuple[str, str]:
+    if "__" not in task_id:
+        return task_id, "target"
+    pair_id, role = task_id.rsplit("__", 1)
+    return pair_id, role
+
+
+def _required_success_files(output_root: Path, pair_id: str, role: str) -> List[Path]:
+    pair_dir = output_root / "pairs" / pair_id
+    return [
+        pair_dir / f"{role}.status.json",
+        pair_dir / f"{role}.metrics.json",
+        pair_dir / f"{role}.best.cif",
+        pair_dir / f"{role}.best_summary.json",
+    ]
+
+
+def _task_status_path(output_root: Path, pair_id: str, role: str) -> Path:
+    return output_root / "pairs" / pair_id / f"{role}.status.json"
+
+
+def _load_task_status(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        return _load_json(path)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _manifest_hash(task_rows: Sequence[Dict[str, Any]], critical_flags: Dict[str, Any]) -> str:
+    payload = {
+        "tasks": [
+            {
+                "task_id": r["task_id"],
+                "pair_id": r["pair_id"],
+                "row_index": r["row_index"],
+                "partner_role": r["partner_role"],
+                "partner_name": r["partner_name"],
+                "partner_seq": _normalize_sequence(str(r.get("partner_seq", ""))),
+                "binder_name": r["binder_name"],
+                "binder_seq": _normalize_sequence(str(r.get("binder_seq", ""))),
+                "target_name": r["target_name"],
+                "target_seq": _normalize_sequence(str(r.get("target_seq", ""))),
+            }
+            for r in task_rows
+        ],
+        "flags": critical_flags,
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return _short_hash(blob, n=32)
 
 
 # =============================================================================
@@ -656,7 +775,11 @@ def _fetch_msa_colabfold(
 
 
 def _cache_entry_valid(cache_dir: Path) -> bool:
-    return (cache_dir / "non_pairing.a3m").exists()
+    non_path = cache_dir / "non_pairing.a3m"
+    try:
+        return bool(non_path.exists() and non_path.stat().st_size > 0)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _write_cache_entry(
@@ -735,6 +858,8 @@ def _get_or_fetch_cached_msa(
                     metadata=metadata,
                 )
                 msa_cache_volume.commit()
+                if not _cache_entry_valid(cache_dir):
+                    raise RuntimeError(f"MSA cache write verification failed for cache_key={cache_key}")
                 return {
                     "status": "fetched_and_cached",
                     "cache_key": cache_key,
@@ -755,6 +880,71 @@ def _get_or_fetch_cached_msa(
     raise RuntimeError(f"MSA fetch failed after retries: {last_err}")
 
 
+def _acquire_global_msa_submit_slot(rate_key: str, min_interval_s: float, lease_s: float = 30.0) -> None:
+    """
+    Best-effort cross-run global rate gate using shared modal.Dict keys.
+    """
+    base = f"msa_rate:{rate_key}"
+    lock_key = f"{base}:lock"
+    next_key = f"{base}:next_submit_at"
+    owner = uuid.uuid4().hex
+
+    reserved_submit_at: Optional[float] = None
+    while True:
+        now = time.time()
+        lock = _dict_get(results_dict, lock_key, None)
+        can_claim = False
+        if not isinstance(lock, dict):
+            can_claim = True
+        else:
+            expires_at = float(lock.get("expires_at", 0.0))
+            if expires_at < now:
+                can_claim = True
+            elif lock.get("owner") == owner:
+                can_claim = True
+        if can_claim:
+            # Keep lock TTL above interval so we can reserve next slot atomically.
+            results_dict[lock_key] = {
+                "owner": owner,
+                "expires_at": now + max(5.0, float(lease_s), float(min_interval_s) + 2.0),
+            }
+            cur = _dict_get(results_dict, lock_key, None)
+            if isinstance(cur, dict) and cur.get("owner") == owner:
+                try:
+                    now2 = time.time()
+                    next_submit_at = float(_dict_get(results_dict, next_key, 0.0) or 0.0)
+                    reserved_submit_at = max(now2, next_submit_at)
+                    results_dict[next_key] = reserved_submit_at + max(0.0, float(min_interval_s))
+                finally:
+                    lock = _dict_get(results_dict, lock_key, None)
+                    if isinstance(lock, dict) and lock.get("owner") == owner:
+                        _dict_pop(results_dict, lock_key)
+                break
+        time.sleep(0.1)
+    if reserved_submit_at is not None:
+        delay = reserved_submit_at - time.time()
+        if delay > 0:
+            time.sleep(delay)
+
+
+def _msa_ref_from_fetch_info(info: Dict[str, Any]) -> Dict[str, Any]:
+    status = str(info.get("status", ""))
+    if status in {"cached", "fetched_and_cached"}:
+        ck = info.get("cache_key")
+        if not ck:
+            raise RuntimeError("MSA cache response missing cache_key")
+        return {"source": "cache", "cache_key": ck}
+    if status == "fetched_no_cache":
+        return {
+            "source": "inline",
+            "pairing": info.get("pairing"),
+            "non_pairing": info.get("non_pairing"),
+        }
+    if status == "error":
+        raise RuntimeError(str(info.get("error", "MSA fetch failed")))
+    raise RuntimeError(f"Unsupported MSA fetch status: {status}")
+
+
 @app.function(
     image=image,
     timeout=7200,
@@ -771,12 +961,20 @@ def precompute_msas(
     db_tag: str = "colabfold_env",
     max_fetch_attempts: int = 4,
 ) -> Dict[str, Dict[str, Any]]:
+    call_started = time.time()
     read_cache, write_cache = _cache_mode_flags(cache_mode, store_alias=store_fetched_msas)
 
     results: Dict[str, Dict[str, Any]] = {}
     unique_sequences = sorted({_normalize_sequence(s) for s in sequences if s})
+    _log(
+        f"[precompute_msas] start role={role} n_seq={len(unique_sequences)} "
+        f"cache_mode={cache_mode} write_cache={write_cache} host={host_url}"
+    )
 
-    for seq in unique_sequences:
+    for i, seq in enumerate(unique_sequences, start=1):
+        seq_hash = _short_hash(seq, n=10)
+        seq_started = time.time()
+        _log(f"[precompute_msas] [{i}/{len(unique_sequences)}] seq={seq_hash} fetching...")
         try:
             info = _get_or_fetch_cached_msa(
                 sequence=seq,
@@ -790,9 +988,18 @@ def precompute_msas(
                 max_fetch_attempts=max_fetch_attempts,
             )
             results[seq] = info
+            _log(
+                f"[precompute_msas] [{i}/{len(unique_sequences)}] seq={seq_hash} "
+                f"status={info.get('status')} elapsed={time.time()-seq_started:.1f}s"
+            )
         except Exception as exc:  # noqa: BLE001
             results[seq] = {"status": "error", "error": str(exc)}
+            _log(
+                f"[precompute_msas] [{i}/{len(unique_sequences)}] seq={seq_hash} "
+                f"status=error elapsed={time.time()-seq_started:.1f}s err={str(exc)[:180]}"
+            )
 
+    _log(f"[precompute_msas] done role={role} elapsed={time.time()-call_started:.1f}s")
     return results
 
 
@@ -831,7 +1038,18 @@ def _load_msa_ref(msa_ref: Dict[str, Any]) -> Dict[str, Optional[str]]:
             return {"pairing": None, "non_pairing": None}
         cache_dir = MSA_CACHE_ROOT / cache_key
         if not _cache_entry_valid(cache_dir):
-            return {"pairing": None, "non_pairing": None}
+            # Handle eventual consistency across containers: immediate retry, then 1s/2s/5s.
+            for delay_s in (0.0, 1.0, 2.0, 5.0):
+                if delay_s > 0:
+                    time.sleep(delay_s)
+                try:
+                    msa_cache_volume.reload()
+                except Exception:  # noqa: BLE001
+                    pass
+                if _cache_entry_valid(cache_dir):
+                    break
+            if not _cache_entry_valid(cache_dir):
+                return {"pairing": None, "non_pairing": None}
         return _read_cache_entry(cache_dir)
     return {"pairing": None, "non_pairing": None}
 
@@ -1321,8 +1539,8 @@ def _to_jsonable(payload: Any) -> Any:
         return str(payload)
 
 
-def _event_key(run_id: str, task_id: str, seq: int) -> str:
-    return f"{run_id}:event:{task_id}:{seq:06d}"
+def _event_key(run_id: str, task_id: str, attempt: int, lease_epoch: int, seq: int) -> str:
+    return f"{run_id}:event:{task_id}:{attempt}:{lease_epoch}:{seq:06d}"
 
 
 def _emit_event_if_needed(
@@ -1330,6 +1548,8 @@ def _emit_event_if_needed(
     task_id: str,
     stream: bool,
     event_seq: List[int],
+    attempt: int,
+    lease_epoch: int,
     event_type: str,
     payload: Optional[Dict[str, Any]] = None,
 ) -> None:
@@ -1342,13 +1562,15 @@ def _emit_event_if_needed(
         {
             "run_id": run_id,
             "task_id": task_id,
+            "attempt": int(attempt),
+            "lease_epoch": int(lease_epoch),
             "seq": seq,
             "event_type": event_type,
             "timestamp": time.time(),
             **(payload or {}),
         }
     )
-    key = _event_key(run_id, task_id, seq)
+    key = _event_key(run_id, task_id, int(attempt), int(lease_epoch), seq)
 
     try:
         results_dict[key] = evt
@@ -1360,6 +1582,8 @@ def _emit_event_if_needed(
         header = {
             "run_id": run_id,
             "task_id": task_id,
+            "attempt": int(attempt),
+            "lease_epoch": int(lease_epoch),
             "seq": seq,
             "event_type": "chunked_event",
             "timestamp": time.time(),
@@ -1377,11 +1601,13 @@ def _emit_event_if_needed(
         for idx, chunk in enumerate(chunks):
             cseq = int(event_seq[0])
             event_seq[0] += 1
-            ckey = _event_key(run_id, task_id, cseq)
+            ckey = _event_key(run_id, task_id, int(attempt), int(lease_epoch), cseq)
             try:
                 results_dict[ckey] = {
                     "run_id": run_id,
                     "task_id": task_id,
+                    "attempt": int(attempt),
+                    "lease_epoch": int(lease_epoch),
                     "seq": cseq,
                     "event_type": "chunk",
                     "timestamp": time.time(),
@@ -1401,153 +1627,30 @@ def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
         f.write(json.dumps(_to_jsonable(payload), ensure_ascii=False) + "\n")
 
 
-def _write_stream_artifacts(stream_root: Path, event: Dict[str, Any]) -> None:
-    task_id = str(event.get("task_id", "unknown_task"))
-    event_type = str(event.get("event_type", ""))
-    if event_type not in {"candidate_found", "best_selected"}:
-        return
-
-    artifacts_root = stream_root / "artifacts" / task_id
-    if event_type == "candidate_found":
-        seed = int(event.get("seed", -1))
-        sample_rank = int(event.get("sample_rank", -1))
-        sample_dir = artifacts_root / f"seed_{seed}" / f"sample_{sample_rank}"
-        sample_dir.mkdir(parents=True, exist_ok=True)
-
-        cif_text = event.get("cif_text")
-        if isinstance(cif_text, str):
-            (sample_dir / "sample.cif").write_text(cif_text)
-
-        summary_json = event.get("summary_confidence_json")
-        if isinstance(summary_json, dict):
-            _save_json(sample_dir / "summary_confidence.json", summary_json)
-
-        full_data_json = event.get("full_data_json")
-        if isinstance(full_data_json, dict):
-            _save_json(sample_dir / "full_data.json", full_data_json)
-        return
-
-    best_dir = artifacts_root / "best"
-    best_dir.mkdir(parents=True, exist_ok=True)
-    cif_text = event.get("cif_text")
-    if isinstance(cif_text, str):
-        (best_dir / "best_sample.cif").write_text(cif_text)
-    summary_json = event.get("summary_confidence_json")
-    if isinstance(summary_json, dict):
-        _save_json(best_dir / "best_summary_confidence.json", summary_json)
-    full_data_json = event.get("full_data_json")
-    if isinstance(full_data_json, dict):
-        _save_json(best_dir / "best_full_data.json", full_data_json)
-
-
-def _save_stream_event(
-    output_root: Path,
-    run_id: str,
-    dict_key: str,
-    event: Dict[str, Any],
-    chunk_state: Dict[Tuple[str, int], Dict[str, Any]],
+def _stream_result_if_needed(
+    result: Dict[str, Any],
+    run_id: Optional[str],
+    task_id: str,
+    stream: bool,
+    attempt: int,
+    lease_epoch: int,
 ) -> None:
-    stream_root = output_root / "_stream" / run_id
-    events_path = stream_root / "events.jsonl"
-    _append_jsonl(events_path, {"dict_key": dict_key, "event": event})
-
-    event_type = str(event.get("event_type", ""))
-    task_id = str(event.get("task_id", "unknown_task"))
-
-    if event_type == "chunked_event":
-        parent_seq = int(event.get("parent_seq", event.get("seq", -1)))
-        key = (task_id, parent_seq)
-        state = chunk_state.setdefault(key, {"header": None, "chunk_count": 0, "chunks": {}})
-        state["header"] = event
-        state["chunk_count"] = int(event.get("chunk_count", 0))
-        return
-
-    if event_type == "chunk":
-        parent_seq = int(event.get("parent_seq", -1))
-        chunk_index = int(event.get("chunk_index", -1))
-        chunk_count = int(event.get("chunk_count", 0))
-        key = (task_id, parent_seq)
-        state = chunk_state.setdefault(key, {"header": None, "chunk_count": chunk_count, "chunks": {}})
-        state["chunk_count"] = max(int(state.get("chunk_count", 0)), chunk_count)
-        if chunk_index >= 0:
-            state["chunks"][chunk_index] = str(event.get("data", ""))
-
-        expected = int(state.get("chunk_count", 0))
-        if expected > 0 and len(state["chunks"]) >= expected:
-            try:
-                payload = "".join(state["chunks"].get(i, "") for i in range(expected))
-                reconstructed = json.loads(payload)
-                _append_jsonl(
-                    events_path,
-                    {
-                        "dict_key": f"{dict_key}:reconstructed",
-                        "reconstructed_from_chunk": True,
-                        "event": reconstructed,
-                    },
-                )
-                _save_stream_event(
-                    output_root=output_root,
-                    run_id=run_id,
-                    dict_key=f"{dict_key}:reconstructed_payload",
-                    event=reconstructed,
-                    chunk_state={},
-                )
-            except Exception as exc:  # noqa: BLE001
-                _append_jsonl(
-                    events_path,
-                    {
-                        "dict_key": f"{dict_key}:reconstruct_error",
-                        "error": str(exc),
-                        "task_id": task_id,
-                        "parent_seq": parent_seq,
-                    },
-                )
-            finally:
-                chunk_state.pop(key, None)
-        return
-
-    if event_type == "log_chunk":
-        log_dir = stream_root / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        channel = str(event.get("channel", "stdout"))
-        text = str(event.get("text", ""))
-        with open(log_dir / f"{task_id}.log", "a", encoding="utf-8") as f:
-            if text:
-                f.write(text)
-            if text and not text.endswith("\n"):
-                f.write("\n")
-        with open(log_dir / f"{task_id}.{channel}.log", "a", encoding="utf-8") as f:
-            if text:
-                f.write(text)
-            if text and not text.endswith("\n"):
-                f.write("\n")
-        return
-
-    _write_stream_artifacts(stream_root=stream_root, event=event)
-
-    status_dir = stream_root / "status"
-    status_dir.mkdir(parents=True, exist_ok=True)
-    status_payload = {
-        "task_id": task_id,
-        "event_type": event_type,
-        "timestamp": event.get("timestamp"),
-        "status": event.get("status"),
-        "stage": event.get("stage"),
-        "message": event.get("message"),
-        "elapsed_s": event.get("elapsed_s"),
-        "best_iptm": event.get("best_iptm"),
-        "error": event.get("error"),
-    }
-    _save_json(status_dir / f"{task_id}.json", _to_jsonable(status_payload))
-
-
-def _stream_result_if_needed(result: Dict[str, Any], run_id: Optional[str], task_id: str, stream: bool) -> None:
     if not stream or not run_id:
         return
-    key = f"{run_id}:{task_id}"
+    key = f"{run_id}:{task_id}:result:{attempt}:{lease_epoch}"
     payload = dict(result)
     payload["timestamp"] = time.time()
-    results_dict[key] = payload
+    payload["attempt"] = int(attempt)
+    payload["lease_epoch"] = int(lease_epoch)
+    for i in range(3):
+        try:
+            results_dict[key] = payload
+            return
+        except Exception as exc:  # noqa: BLE001
+            if i == 2:
+                print(f"[stream] failed to emit terminal result for {task_id}: {exc}")
+                return
+            time.sleep(min(1.0, 0.2 * (2 ** i)))
 
 
 # =============================================================================
@@ -1574,11 +1677,15 @@ def _run_protenix_task_impl(task: Dict[str, Any]) -> Dict[str, Any]:
         "binder_seq": task["binder_seq"],
         "target_seq": task["target_seq"],
         "selection_scope": task["best_sample_scope"],
+        "attempt": int(task.get("attempt", 1)),
+        "lease_epoch": int(task.get("lease_epoch", 0)),
         "error": None,
     }
 
     run_id = task.get("run_id")
-    stream = bool(task.get("stream_to_dict", False))
+    attempt = int(task.get("attempt", 1))
+    lease_epoch = int(task.get("lease_epoch", 0))
+    stream = True
     stream_logs = bool(task.get("stream_logs", True))
     log_chunk_seconds = max(0.1, float(task.get("log_chunk_seconds", 1.0)))
     heartbeat_seconds = max(1.0, float(task.get("heartbeat_seconds", 15.0)))
@@ -1594,6 +1701,8 @@ def _run_protenix_task_impl(task: Dict[str, Any]) -> Dict[str, Any]:
             task_id=task_id,
             stream=stream,
             event_seq=event_seq,
+            attempt=attempt,
+            lease_epoch=lease_epoch,
             event_type=event_type,
             payload=payload,
         )
@@ -1650,7 +1759,14 @@ def _run_protenix_task_impl(task: Dict[str, Any]) -> Dict[str, Any]:
 
         # If no target MSA is available for target role, hard fail.
         if partner_role == "target" and not partner_msa.get("non_pairing"):
-            raise RuntimeError("Target MSA is required but missing for this task")
+            partner_ref = task.get("partner_msa_ref", {}) or {}
+            source = str(partner_ref.get("source", "unknown"))
+            cache_key = str(partner_ref.get("cache_key", ""))
+            retry_note = "retry_delays_s=0,1,2,5 total_wait_s<=8"
+            ctx = f"source={source} {retry_note}"
+            if cache_key:
+                ctx += f" cache_key={cache_key}"
+            raise RuntimeError(f"Target MSA is required but missing for this task ({ctx})")
 
         sample_name = f"{task_id}_pred"
         input_dir = work_dir / "input"
@@ -1707,7 +1823,7 @@ def _run_protenix_task_impl(task: Dict[str, Any]) -> Dict[str, Any]:
                 )
 
         def on_inference_line(channel: str, line: str) -> None:
-            if stream and stream_logs:
+            if stream_logs:
                 pending_logs[channel].append(line)
                 flush_log_chunks(force=False)
 
@@ -1891,7 +2007,14 @@ def _run_protenix_task_impl(task: Dict[str, Any]) -> Dict[str, Any]:
         )
     finally:
         flush_log_chunks(force=True)
-        _stream_result_if_needed(result=result, run_id=run_id, task_id=task_id, stream=stream)
+        _stream_result_if_needed(
+            result=result,
+            run_id=run_id,
+            task_id=task_id,
+            stream=stream,
+            attempt=attempt,
+            lease_epoch=lease_epoch,
+        )
         shutil.rmtree(work_dir, ignore_errors=True)
 
     return result
@@ -2014,75 +2137,92 @@ GPU_FUNCTIONS = {
 # OUTPUT + STREAMING
 # =============================================================================
 
+def _pair_role_paths(output_root: Path, pair_id: str, role: str) -> Dict[str, Path]:
+    pair_dir = output_root / "pairs" / pair_id
+    return {
+        "pair_dir": pair_dir,
+        "pair_json": pair_dir / "pair.json",
+        "status": pair_dir / f"{role}.status.json",
+        "metrics": pair_dir / f"{role}.metrics.json",
+        "best_cif": pair_dir / f"{role}.best.cif",
+        "best_summary": pair_dir / f"{role}.best_summary.json",
+        "ipsae": pair_dir / f"{role}.ipsae.json",
+        "candidates_dir": pair_dir / f"{role}.candidates",
+    }
+
+
+def _merge_status_file(path: Path, patch: Dict[str, Any]) -> None:
+    cur = _load_task_status(path) or {}
+    cur.update(_to_jsonable(patch))
+    cur["updated_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+    _atomic_save_json(path, cur)
+
+
+def _authoritative_epoch(output_root: Path, pair_id: str, role: str) -> Tuple[int, int]:
+    status = _load_task_status(_task_status_path(output_root, pair_id, role)) or {}
+    return int(status.get("attempt", 0)), int(status.get("lease_epoch", 0))
+
+
 def _save_task_result(output_root: Path, result: Dict[str, Any]) -> None:
-    pair_id = result["pair_id"]
-    role = result["partner_role"]
-    pair_dir = output_root / "pair_runs" / pair_id / role
-    pair_dir.mkdir(parents=True, exist_ok=True)
+    pair_id = str(result["pair_id"])
+    role = str(result["partner_role"])
+    p = _pair_role_paths(output_root, pair_id, role)
+    p["pair_dir"].mkdir(parents=True, exist_ok=True)
 
-    _save_json(pair_dir / "metrics.json", result)
+    pair_payload = {
+        "pair_id": pair_id,
+        "row_index": result.get("row_index"),
+        "binder_name": result.get("binder_name"),
+        "binder_seq": result.get("binder_seq"),
+        "target_name": result.get("target_name"),
+        "target_seq": result.get("target_seq"),
+    }
+    _atomic_save_json(p["pair_json"], _to_jsonable(pair_payload))
+    _atomic_save_json(p["metrics"], _to_jsonable(result))
 
-    if result.get("input_json"):
-        _save_json(pair_dir / "input.json", {"input": result["input_json"]})
+    status_payload = {
+        "task_id": result.get("task_id"),
+        "pair_id": pair_id,
+        "role": role,
+        "scheduler_state": "done",
+        "exec_state": "success" if result.get("status") == "success" else "error",
+        "stage": "complete" if result.get("status") == "success" else "error",
+        "attempt": int(result.get("attempt", 1)),
+        "lease_epoch": int(result.get("lease_epoch", 0)),
+        "lease_owner": None,
+        "lease_expires_at": None,
+        "completed_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "error": result.get("error"),
+        "best_iptm": result.get("best_iptm"),
+        "best_seed": result.get("best_seed"),
+        "best_sample_rank": result.get("best_sample_rank"),
+    }
+    _merge_status_file(p["status"], status_payload)
 
     if result.get("status") != "success":
         return
 
-    best_dir = pair_dir / "best"
-    best_dir.mkdir(parents=True, exist_ok=True)
-    (best_dir / "best_sample.cif").write_text(result.get("best_cif", ""))
-    _save_json(best_dir / "best_summary_confidence.json", result.get("best_summary", {}))
+    _atomic_write_text(p["best_cif"], str(result.get("best_cif", "")))
+    _atomic_save_json(p["best_summary"], _to_jsonable(result.get("best_summary", {})))
 
-    ipsae = result.get("ipsae", {})
+    ipsae = result.get("ipsae", {}) or {}
     if ipsae:
-        ipsae_dir = pair_dir / "ipsae"
-        ipsae_dir.mkdir(parents=True, exist_ok=True)
-        if ipsae.get("raw_text"):
-            (ipsae_dir / "best_sample_ipsae.txt").write_text(ipsae.get("raw_text", ""))
-        _save_json(ipsae_dir / "ipsae_metrics.json", ipsae)
+        _atomic_save_json(p["ipsae"], _to_jsonable(ipsae))
 
     raw = result.get("protenix_raw", {}) or {}
-    if raw:
-        raw_dir = pair_dir / "protenix_raw"
-        raw_dir.mkdir(parents=True, exist_ok=True)
-
-        if raw.get("inference_stdout_tail"):
-            (raw_dir / "inference_stdout_tail.log").write_text(raw["inference_stdout_tail"])
-        if raw.get("inference_stderr_tail"):
-            (raw_dir / "inference_stderr_tail.log").write_text(raw["inference_stderr_tail"])
-
-        candidate_summaries = raw.get("candidate_summaries", []) or []
-        manifest_rows: List[Dict[str, Any]] = []
+    candidate_summaries = raw.get("candidate_summaries", []) or []
+    if candidate_summaries:
+        p["candidates_dir"].mkdir(parents=True, exist_ok=True)
         for item in candidate_summaries:
             seed = int(item.get("seed", -1))
             sample_rank = int(item.get("sample_rank", -1))
-            seed_dir = raw_dir / f"seed_{seed}"
-            seed_dir.mkdir(parents=True, exist_ok=True)
-
             summary = item.get("summary")
             if isinstance(summary, dict):
-                summary_path = seed_dir / f"summary_confidence_sample_{sample_rank}.json"
-                _save_json(summary_path, summary)
+                _atomic_save_json(
+                    p["candidates_dir"] / f"s{seed}_n{sample_rank}.summary.json",
+                    summary,
+                )
 
-            manifest_rows.append(
-                {
-                    "seed": seed,
-                    "sample_rank": sample_rank,
-                    "iptm": item.get("iptm"),
-                    "ptm": item.get("ptm"),
-                    "ranking_score": item.get("ranking_score"),
-                }
-            )
-
-        _save_json(
-            raw_dir / "manifest.json",
-            {
-                "n_candidates": len(candidate_summaries),
-                "candidates": manifest_rows,
-            },
-        )
-
-    # Only target role contributes to best_by_target grouping.
     if role == "target":
         binder_slug = _slugify(result.get("binder_name", "binder"))
         target_slug = _slugify(result.get("target_name", "target"))
@@ -2090,16 +2230,13 @@ def _save_task_result(output_root: Path, result: Dict[str, Any]) -> None:
             f"{result.get('binder_name','')}|{result.get('target_name','')}|{result.get('row_index',0)}"
         )
         out_name = f"{binder_slug}__vs__{target_slug}__{pair_hash}.cif"
-        grouped_dir = output_root / "best_by_target" / target_slug
+        grouped_dir = output_root / "by_target" / target_slug
         grouped_dir.mkdir(parents=True, exist_ok=True)
-        (grouped_dir / out_name).write_text(result.get("best_cif", ""))
+        _atomic_write_text(grouped_dir / out_name, str(result.get("best_cif", "")))
 
 
 def _write_summary_csv(output_root: Path, results: Sequence[Dict[str, Any]]) -> Path:
-    out_dir = output_root / "summaries"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = out_dir / "pair_summary.csv"
-
+    csv_path = output_root / "pair_summary.csv"
     header = [
         "task_id",
         "pair_id",
@@ -2123,14 +2260,12 @@ def _write_summary_csv(output_root: Path, results: Sequence[Dict[str, Any]]) -> 
         "ipsae_error",
         "error",
     ]
-
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-
+        w = csv.writer(f)
+        w.writerow(header)
         for r in results:
             ipsae = r.get("ipsae", {}) or {}
-            writer.writerow(
+            w.writerow(
                 [
                     r.get("task_id"),
                     r.get("pair_id"),
@@ -2155,8 +2290,263 @@ def _write_summary_csv(output_root: Path, results: Sequence[Dict[str, Any]]) -> 
                     r.get("error"),
                 ]
             )
-
     return csv_path
+
+
+def _redact_event(event: Dict[str, Any], artifact_paths: List[str], stale_epoch: bool) -> Dict[str, Any]:
+    redacted = dict(event)
+    for heavy in ("cif_text", "summary_confidence_json", "full_data_json", "text", "data"):
+        if heavy in redacted:
+            del redacted[heavy]
+    redacted["artifact_paths"] = artifact_paths
+    redacted["stale_epoch"] = bool(stale_epoch)
+    return redacted
+
+
+def _save_stream_event(output_root: Path, dict_key: str, event: Dict[str, Any]) -> None:
+    task_id = str(event.get("task_id", "unknown_task"))
+    pair_id, role = _parse_task_id(task_id)
+    attempt = int(event.get("attempt", 0))
+    lease_epoch = int(event.get("lease_epoch", 0))
+    event_type = str(event.get("event_type", ""))
+    p = _pair_role_paths(output_root, pair_id, role)
+    p["pair_dir"].mkdir(parents=True, exist_ok=True)
+
+    current_attempt, current_epoch = _authoritative_epoch(output_root, pair_id, role)
+    stale_epoch = (attempt < current_attempt) or (
+        attempt == current_attempt and lease_epoch < current_epoch
+    )
+
+    artifact_paths: List[str] = []
+    if event_type == "log_chunk":
+        log_dir = output_root / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        channel = str(event.get("channel", "stdout"))
+        text = str(event.get("text", ""))
+        for lp in (log_dir / f"{task_id}.log", log_dir / f"{task_id}.{channel}.log"):
+            with open(lp, "a", encoding="utf-8") as f:
+                if text:
+                    f.write(text)
+                if text and not text.endswith("\n"):
+                    f.write("\n")
+    elif not stale_epoch:
+        if event_type == "candidate_found":
+            seed = int(event.get("seed", -1))
+            sample_rank = int(event.get("sample_rank", -1))
+            p["candidates_dir"].mkdir(parents=True, exist_ok=True)
+            cif_path = p["candidates_dir"] / f"s{seed}_n{sample_rank}.cif"
+            summary_path = p["candidates_dir"] / f"s{seed}_n{sample_rank}.summary.json"
+            full_path = p["candidates_dir"] / f"s{seed}_n{sample_rank}.full_data.json"
+            if isinstance(event.get("cif_text"), str):
+                _atomic_write_text(cif_path, str(event.get("cif_text", "")))
+                artifact_paths.append(str(cif_path.relative_to(output_root)))
+            if isinstance(event.get("summary_confidence_json"), dict):
+                _atomic_save_json(summary_path, _to_jsonable(event["summary_confidence_json"]))
+                artifact_paths.append(str(summary_path.relative_to(output_root)))
+            if isinstance(event.get("full_data_json"), dict):
+                _atomic_save_json(full_path, _to_jsonable(event["full_data_json"]))
+                artifact_paths.append(str(full_path.relative_to(output_root)))
+        elif event_type == "best_selected":
+            if isinstance(event.get("cif_text"), str):
+                _atomic_write_text(p["best_cif"], str(event.get("cif_text", "")))
+                artifact_paths.append(str(p["best_cif"].relative_to(output_root)))
+            if isinstance(event.get("summary_confidence_json"), dict):
+                _atomic_save_json(p["best_summary"], _to_jsonable(event["summary_confidence_json"]))
+                artifact_paths.append(str(p["best_summary"].relative_to(output_root)))
+
+        if event_type in {"task_started", "msa_started", "msa_done", "inference_started", "heartbeat", "task_done", "task_error"}:
+            _merge_status_file(
+                p["status"],
+                {
+                    "task_id": task_id,
+                    "pair_id": pair_id,
+                    "role": role,
+                    "attempt": attempt,
+                    "lease_epoch": lease_epoch,
+                    "stage": event.get("stage"),
+                    "exec_state": "running" if event_type not in {"task_done", "task_error"} else ("success" if event_type == "task_done" else "error"),
+                    "error": event.get("error"),
+                    "best_iptm": event.get("best_iptm"),
+                    "elapsed_s": event.get("elapsed_s"),
+                },
+            )
+
+    events_path = output_root / "events.jsonl"
+    _append_jsonl(
+        events_path,
+        {
+            "dict_key": dict_key,
+            "event": _redact_event(event, artifact_paths=artifact_paths, stale_epoch=stale_epoch),
+        },
+    )
+
+
+def _sync_state_path(output_root: Path, run_id: str) -> Path:
+    return output_root / f".sync_state_{run_id}.json"
+
+
+def _default_sync_state() -> Dict[str, Any]:
+    return {
+        "applied_ids": [],
+        "streams": {},
+        "results": {},
+        "chunk_state": {},
+    }
+
+
+def _load_sync_state(output_root: Path, run_id: str) -> Dict[str, Any]:
+    path = _sync_state_path(output_root, run_id)
+    if not path.exists():
+        return _default_sync_state()
+    try:
+        loaded = _load_json(path)
+        if not isinstance(loaded, dict):
+            return _default_sync_state()
+        out = _default_sync_state()
+        for k in out.keys():
+            v = loaded.get(k)
+            if isinstance(out[k], dict):
+                out[k] = v if isinstance(v, dict) else {}
+            elif isinstance(out[k], list):
+                out[k] = v if isinstance(v, list) else []
+            else:
+                out[k] = v
+        return out
+    except Exception:  # noqa: BLE001
+        return _default_sync_state()
+
+
+def _compact_sync_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(state)
+    applied_ids = [str(x) for x in list(out.get("applied_ids", []))]
+    if len(applied_ids) > 20000:
+        applied_ids = applied_ids[-20000:]
+    out["applied_ids"] = applied_ids
+
+    streams = out.get("streams", {})
+    if not isinstance(streams, dict):
+        streams = {}
+    if len(streams) > 50000:
+        # Keep most recently created stream ids by lexical order for bounded state size.
+        keep = sorted(streams.keys())[-50000:]
+        streams = {k: streams[k] for k in keep}
+    for sid, sval in list(streams.items()):
+        if not isinstance(sval, dict):
+            streams[sid] = {"last_contiguous_seq": -1, "out_of_order": []}
+            continue
+        ooo = [int(x) for x in sval.get("out_of_order", [])]
+        if len(ooo) > 2000:
+            ooo = sorted(ooo)[-2000:]
+        streams[sid] = {
+            "last_contiguous_seq": int(sval.get("last_contiguous_seq", -1)),
+            "out_of_order": sorted(ooo),
+        }
+    out["streams"] = streams
+
+    results = out.get("results", {})
+    if not isinstance(results, dict):
+        results = {}
+    if len(results) > 50000:
+        keep = sorted(results.keys())[-50000:]
+        results = {k: results[k] for k in keep}
+    out["results"] = results
+
+    chunk_state = out.get("chunk_state", {})
+    if not isinstance(chunk_state, dict):
+        chunk_state = {}
+    if len(chunk_state) > 5000:
+        keep = sorted(chunk_state.keys())[-5000:]
+        chunk_state = {k: chunk_state[k] for k in keep}
+    out["chunk_state"] = chunk_state
+    return out
+
+
+def _persist_sync_state(output_root: Path, run_id: str, state: Dict[str, Any]) -> None:
+    compacted = _compact_sync_state(state)
+    _atomic_save_json(_sync_state_path(output_root, run_id), _to_jsonable(compacted))
+
+
+def _stream_state_id(task_id: str, attempt: int, lease_epoch: int) -> str:
+    return f"{task_id}:{attempt}:{lease_epoch}"
+
+
+def _stream_event_already_applied(state: Dict[str, Any], event: Dict[str, Any]) -> bool:
+    seq = int(event.get("seq", -1))
+    if seq < 0:
+        return False
+    task_id = str(event.get("task_id", "unknown_task"))
+    attempt = int(event.get("attempt", 0))
+    lease_epoch = int(event.get("lease_epoch", 0))
+    stream_id = _stream_state_id(task_id, attempt, lease_epoch)
+    streams = state.setdefault("streams", {})
+    s = streams.get(stream_id)
+    if not isinstance(s, dict):
+        return False
+    last = int(s.get("last_contiguous_seq", -1))
+    if seq <= last:
+        return True
+    ooo = {int(x) for x in s.get("out_of_order", [])}
+    return seq in ooo
+
+
+def _track_stream_watermark(state: Dict[str, Any], event: Dict[str, Any]) -> None:
+    task_id = str(event.get("task_id", "unknown_task"))
+    attempt = int(event.get("attempt", 0))
+    lease_epoch = int(event.get("lease_epoch", 0))
+    seq = int(event.get("seq", -1))
+    if seq < 0:
+        return
+    stream_id = _stream_state_id(task_id, attempt, lease_epoch)
+    streams = state.setdefault("streams", {})
+    s = streams.setdefault(stream_id, {"last_contiguous_seq": -1, "out_of_order": []})
+    last = int(s.get("last_contiguous_seq", -1))
+    ooo = {int(x) for x in s.get("out_of_order", [])}
+    if seq <= last:
+        return
+    if seq == last + 1:
+        last = seq
+        while (last + 1) in ooo:
+            ooo.remove(last + 1)
+            last += 1
+    else:
+        ooo.add(seq)
+    s["last_contiguous_seq"] = last
+    s["out_of_order"] = sorted(ooo)
+
+
+def _result_already_applied(state: Dict[str, Any], result_payload: Dict[str, Any]) -> bool:
+    task_id = str(result_payload.get("task_id", ""))
+    if not task_id:
+        return False
+    attempt = int(result_payload.get("attempt", 0))
+    lease_epoch = int(result_payload.get("lease_epoch", 0))
+    seen = state.setdefault("results", {}).get(task_id)
+    if not isinstance(seen, dict):
+        return False
+    s_attempt = int(seen.get("attempt", -1))
+    s_epoch = int(seen.get("lease_epoch", -1))
+    return (attempt < s_attempt) or (attempt == s_attempt and lease_epoch <= s_epoch)
+
+
+def _mark_result_applied(state: Dict[str, Any], result_payload: Dict[str, Any]) -> None:
+    task_id = str(result_payload.get("task_id", ""))
+    if not task_id:
+        return
+    attempt = int(result_payload.get("attempt", 0))
+    lease_epoch = int(result_payload.get("lease_epoch", 0))
+    results = state.setdefault("results", {})
+    cur = results.get(task_id)
+    if not isinstance(cur, dict):
+        results[task_id] = {"attempt": attempt, "lease_epoch": lease_epoch}
+        return
+    c_attempt = int(cur.get("attempt", -1))
+    c_epoch = int(cur.get("lease_epoch", -1))
+    if (attempt > c_attempt) or (attempt == c_attempt and lease_epoch > c_epoch):
+        results[task_id] = {"attempt": attempt, "lease_epoch": lease_epoch}
+
+
+def _chunk_state_key(task_id: str, attempt: int, lease_epoch: int, parent_seq: int) -> str:
+    return f"{task_id}:{attempt}:{lease_epoch}:{parent_seq}"
 
 
 def _sync_worker(
@@ -2165,48 +2555,179 @@ def _sync_worker(
     stop_event: threading.Event,
     interval: float = 5.0,
 ) -> None:
-    synced = set()
-    chunk_state: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    state = _load_sync_state(output_dir, run_id)
+    applied_ids = set(str(x) for x in state.get("applied_ids", []))
+    lock = threading.Lock()
+    chunk_state: Dict[str, Dict[str, Any]] = {
+        str(k): v for k, v in dict(state.get("chunk_state", {})).items() if isinstance(v, dict)
+    }
+
+    def flush_complete_chunk_state() -> bool:
+        changed_local = False
+        for ckey, st in list(chunk_state.items()):
+            marker = f"reconstructed:{ckey}"
+            if marker in applied_ids:
+                chunk_state.pop(ckey, None)
+                changed_local = True
+                continue
+            expected = int(st.get("chunk_count", 0))
+            chunks = dict(st.get("chunks", {}))
+            if expected <= 0 or len(chunks) < expected:
+                continue
+            task_id = str(st.get("task_id", "unknown_task"))
+            parent_seq = int(st.get("parent_seq", -1))
+            base_key = str(st.get("header_dict_key", f"{run_id}:event:{task_id}:unknown"))
+            try:
+                joined = "".join(chunks.get(str(i), "") for i in range(expected))
+                reconstructed = json.loads(joined)
+                _save_stream_event(
+                    output_root=output_dir,
+                    dict_key=f"{base_key}:reconstructed",
+                    event=reconstructed,
+                )
+                _track_stream_watermark(state, reconstructed)
+            except Exception as exc:  # noqa: BLE001
+                _append_jsonl(
+                    output_dir / "events.jsonl",
+                    {
+                        "dict_key": f"{base_key}:reconstruct_error",
+                        "event": {"error": str(exc), "task_id": task_id, "parent_seq": parent_seq},
+                    },
+                )
+            finally:
+                applied_ids.add(marker)
+                chunk_state.pop(ckey, None)
+                changed_local = True
+        return changed_local
+
+    def sync_once() -> None:
+        changed = flush_complete_chunk_state()
+        keys = sorted(k for k in results_dict.keys() if k.startswith(f"{run_id}:"))
+        ack_keys: List[str] = []
+
+        def ack_transport_key(dict_key: str) -> None:
+            try:
+                _dict_pop(results_dict, dict_key)
+            except Exception:  # noqa: BLE001
+                pass
+
+        for key in keys:
+            if key in applied_ids:
+                ack_keys.append(key)
+                continue
+            payload = _dict_get(results_dict, key, None)
+            if payload is None:
+                continue
+            if ":event:" in key:
+                if _stream_event_already_applied(state, payload):
+                    applied_ids.add(key)
+                    ack_keys.append(key)
+                    changed = True
+                    continue
+                event_type = str(payload.get("event_type", ""))
+                if event_type == "chunked_event":
+                    t = str(payload.get("task_id", "unknown_task"))
+                    a = int(payload.get("attempt", 0))
+                    e = int(payload.get("lease_epoch", 0))
+                    parent_seq = int(payload.get("parent_seq", payload.get("seq", -1)))
+                    ckey = _chunk_state_key(t, a, e, parent_seq)
+                    st = chunk_state.get(ckey, {})
+                    st["task_id"] = t
+                    st["attempt"] = a
+                    st["lease_epoch"] = e
+                    st["parent_seq"] = parent_seq
+                    st["chunk_count"] = max(int(st.get("chunk_count", 0)), int(payload.get("chunk_count", 0)))
+                    st["chunks"] = dict(st.get("chunks", {}))
+                    st["header_dict_key"] = str(key)
+                    st["header_event"] = dict(payload)
+                    chunk_state[ckey] = st
+                    _save_stream_event(output_root=output_dir, dict_key=key, event=payload)
+                    _track_stream_watermark(state, payload)
+                elif event_type == "chunk":
+                    t = str(payload.get("task_id", "unknown_task"))
+                    a = int(payload.get("attempt", 0))
+                    e = int(payload.get("lease_epoch", 0))
+                    parent_seq = int(payload.get("parent_seq", -1))
+                    idx = int(payload.get("chunk_index", -1))
+                    cc = int(payload.get("chunk_count", 0))
+                    ckey = _chunk_state_key(t, a, e, parent_seq)
+                    st = chunk_state.setdefault(
+                        ckey,
+                        {
+                            "task_id": t,
+                            "attempt": a,
+                            "lease_epoch": e,
+                            "parent_seq": parent_seq,
+                            "chunk_count": cc,
+                            "chunks": {},
+                        },
+                    )
+                    st["chunk_count"] = max(int(st.get("chunk_count", 0)), cc)
+                    st["chunks"] = dict(st.get("chunks", {}))
+                    if idx >= 0:
+                        st["chunks"][str(idx)] = str(payload.get("data", ""))
+                    _track_stream_watermark(state, payload)
+                    expected = int(st.get("chunk_count", 0))
+                    if expected > 0 and len(st["chunks"]) >= expected:
+                        marker = f"reconstructed:{ckey}"
+                        try:
+                            joined = "".join(st["chunks"].get(str(i), "") for i in range(expected))
+                            reconstructed = json.loads(joined)
+                            base_key = str(st.get("header_dict_key", key))
+                            _save_stream_event(
+                                output_root=output_dir,
+                                dict_key=f"{base_key}:reconstructed",
+                                event=reconstructed,
+                            )
+                            _track_stream_watermark(state, reconstructed)
+                        except Exception as exc:  # noqa: BLE001
+                            _append_jsonl(
+                                output_dir / "events.jsonl",
+                                {
+                                    "dict_key": f"{key}:reconstruct_error",
+                                    "event": {"error": str(exc), "task_id": t, "parent_seq": parent_seq},
+                                },
+                            )
+                        finally:
+                            applied_ids.add(marker)
+                            chunk_state.pop(ckey, None)
+                else:
+                    _save_stream_event(output_root=output_dir, dict_key=key, event=payload)
+                    _track_stream_watermark(state, payload)
+            else:
+                if _result_already_applied(state, payload):
+                    applied_ids.add(key)
+                    ack_keys.append(key)
+                    changed = True
+                    continue
+                _save_task_result(output_dir, payload)
+                _mark_result_applied(state, payload)
+            applied_ids.add(key)
+            ack_keys.append(key)
+            changed = True
+        if changed:
+            with lock:
+                state["applied_ids"] = sorted(applied_ids)
+                state["chunk_state"] = chunk_state
+                _persist_sync_state(output_dir, run_id, state)
+        for k in ack_keys:
+            ack_transport_key(k)
+
+    # Pre-sync replay: apply any durable keys before entering periodic loop.
+    try:
+        sync_once()
+    except Exception:  # noqa: BLE001
+        pass
+
     while not stop_event.is_set():
         try:
-            keys = sorted(k for k in results_dict.keys() if k.startswith(f"{run_id}:"))
-            for key in keys:
-                if key in synced:
-                    continue
-                payload = results_dict[key]
-                if ":event:" in key:
-                    _save_stream_event(
-                        output_root=output_dir,
-                        run_id=run_id,
-                        dict_key=key,
-                        event=payload,
-                        chunk_state=chunk_state,
-                    )
-                else:
-                    _save_task_result(output_dir, payload)
-                synced.add(key)
+            sync_once()
         except Exception:  # noqa: BLE001
             pass
         stop_event.wait(timeout=interval)
 
-    # Final flush.
     try:
-        keys = sorted(k for k in results_dict.keys() if k.startswith(f"{run_id}:"))
-        for key in keys:
-            if key in synced:
-                continue
-            payload = results_dict[key]
-            if ":event:" in key:
-                _save_stream_event(
-                    output_root=output_dir,
-                    run_id=run_id,
-                    dict_key=key,
-                    event=payload,
-                    chunk_state=chunk_state,
-                )
-            else:
-                _save_task_result(output_dir, payload)
-            synced.add(key)
+        sync_once()
     except Exception:  # noqa: BLE001
         pass
 
@@ -2283,15 +2804,31 @@ def run_pipeline(
     gpu: str = DEFAULT_GPU,
     max_parallel: int = 1,
     # Streaming
-    no_stream: bool = False,
     stream_logs: bool = True,
     log_chunk_seconds: float = 1.0,
     heartbeat_seconds: float = 15.0,
     run_id: Optional[str] = None,
     sync_interval: float = 5.0,
+    # Resume controls
+    resume: str = "auto",  # auto|always|never
+    retry_errors: bool = True,
+    stale_running_minutes: int = 30,
+    overwrite_existing: bool = False,
+    resume_manifest_override: bool = False,
+    # Worker/lease controls
+    worker_max_runtime_s: int = 6800,
+    worker_max_tasks: int = 0,
+    worker_idle_timeout_s: int = 120,
+    lease_timeout_s: int = 900,
+    lease_heartbeat_interval_s: int = 60,
+    # MSA scheduler controls
+    msa_min_submit_interval_s: float = 1.0,
+    msa_global_rate_key: str = "protenix_msa_global",
+    msa_max_inflight: int = 1,
 ):
-    stream = not _coerce_bool(no_stream)
-
+    max_parallel = int(max_parallel)
+    if max_parallel < 1:
+        raise ValueError("--max-parallel must be >= 1")
     if gpu not in GPU_FUNCTIONS:
         raise ValueError(f"Unknown GPU type '{gpu}'. Available: {sorted(GPU_FUNCTIONS.keys())}")
 
@@ -2299,8 +2836,23 @@ def run_pipeline(
     include_self = _coerce_bool(include_self)
     mmseqs_store_fetched_msas = _coerce_bool(mmseqs_store_fetched_msas)
     stream_logs = _coerce_bool(stream_logs)
+    retry_errors = _coerce_bool(retry_errors)
+    overwrite_existing = _coerce_bool(overwrite_existing)
+    resume_manifest_override = _coerce_bool(resume_manifest_override)
     log_chunk_seconds = max(0.1, float(log_chunk_seconds))
     heartbeat_seconds = max(1.0, float(heartbeat_seconds))
+    stale_running_minutes = max(1, int(stale_running_minutes))
+    lease_timeout_s = max(60, int(lease_timeout_s))
+    lease_heartbeat_interval_s = max(10, int(lease_heartbeat_interval_s))
+    worker_max_runtime_s = max(300, int(worker_max_runtime_s))
+    worker_idle_timeout_s = max(10, int(worker_idle_timeout_s))
+    worker_max_tasks = int(worker_max_tasks)
+    msa_min_submit_interval_s = max(0.0, float(msa_min_submit_interval_s))
+    resume_n = str(resume).strip().lower()
+    if resume_n not in {"auto", "always", "never"}:
+        raise ValueError("--resume must be one of: auto,always,never")
+    if int(msa_max_inflight) != 1:
+        raise ValueError("--msa-max-inflight currently must be 1 in this implementation")
 
     if mmseqs_cache_dir != str(MSA_CACHE_ROOT):
         print(
@@ -2328,6 +2880,12 @@ def run_pipeline(
         raise ValueError("Only --mmseqs-mode colabfold is supported in this pipeline")
 
     host_url = _resolve_mmseqs_host(mmseqs_host_url, mmseqs_host_policy)
+    context_hash = _msa_context_hash(
+        mmseqs_mode="colabfold",
+        mmseqs_host_url=host_url,
+        mmseqs_db_tag=mmseqs_db_tag,
+        mmseqs_pairing_strategy=mmseqs_pairing_strategy,
+    )
 
     pair_rows = _load_pair_rows(Path(pair_csv))
     if not pair_rows:
@@ -2392,133 +2950,54 @@ def run_pipeline(
             if not antitarget_msa_inline.get("non_pairing"):
                 raise ValueError("Provided antitarget MSA must include non_pairing.a3m")
 
-    # Precompute dynamic MSAs (deduped) when needed.
-    binder_cache: Dict[str, Dict[str, Any]] = {}
-    if binder_mode_n == "full_msa":
-        binder_seqs = sorted({r["binder_seq"] for r in pair_rows})
-        print(f"Precomputing binder MSAs for {len(binder_seqs)} unique sequence(s)...")
-        binder_cache = precompute_msas.remote(
-            sequences=binder_seqs,
-            role="binder",
-            host_url=host_url,
-            cache_mode=mmseqs_cache_mode,
-            store_fetched_msas=mmseqs_store_fetched_msas,
-            msa_mode="colabfold",
-            pairing_strategy=mmseqs_pairing_strategy,
-            db_tag=mmseqs_db_tag,
-        )
+    dep_requests: Dict[str, Dict[str, Any]] = {}
 
-    target_cache: Dict[str, Dict[str, Any]] = {}
-    if target_msa_source_n == "mmseqs":
-        target_seqs = sorted({r["target_seq"] for r in pair_rows})
-        print(f"Precomputing target MSAs for {len(target_seqs)} unique sequence(s)...")
-        target_cache = precompute_msas.remote(
-            sequences=target_seqs,
-            role="target",
-            host_url=host_url,
-            cache_mode=mmseqs_cache_mode,
-            store_fetched_msas=mmseqs_store_fetched_msas,
-            msa_mode="colabfold",
-            pairing_strategy=mmseqs_pairing_strategy,
-            db_tag=mmseqs_db_tag,
+    def dep_for(role: str, seq: str) -> str:
+        key = _msa_dependency_key(role=role, sequence=seq, context_hash=context_hash)
+        dep_requests.setdefault(
+            key,
+            {
+                "dep_key": key,
+                "role": role,
+                "sequence": _normalize_sequence(seq),
+            },
         )
+        return key
 
-    antitarget_cache: Dict[str, Dict[str, Any]] = {}
-    if include_antitarget and antitarget_msa_source_n == "mmseqs":
-        antitarget_cache = precompute_msas.remote(
-            sequences=[antitarget_seq],
-            role="antitarget",
-            host_url=host_url,
-            cache_mode=mmseqs_cache_mode,
-            store_fetched_msas=mmseqs_store_fetched_msas,
-            msa_mode="colabfold",
-            pairing_strategy=mmseqs_pairing_strategy,
-            db_tag=mmseqs_db_tag,
-        )
-
-    def binder_msa_ref_for(seq: str) -> Dict[str, Any]:
+    def binder_source(seq: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         if binder_mode_n == "de_novo":
-            return {"source": "none"}
+            return {"source": "none"}, None
         if binder_mode_n == "fixed_msa":
             return {
                 "source": "inline",
                 "pairing": fixed_binder_msa.get("pairing") if fixed_binder_msa else None,
                 "non_pairing": fixed_binder_msa.get("non_pairing") if fixed_binder_msa else None,
-            }
-        # full_msa
-        info = binder_cache.get(seq, {})
-        if info.get("status") == "error":
-            raise RuntimeError(f"Binder MSA fetch failed for sequence hash={_short_hash(seq)}: {info.get('error')}")
-        if info.get("status") == "fetched_no_cache":
-            if not info.get("non_pairing"):
-                raise RuntimeError("Binder MSA fetch returned no non_pairing content")
-            return {
-                "source": "inline",
-                "pairing": info.get("pairing"),
-                "non_pairing": info.get("non_pairing"),
-            }
-        ck = info.get("cache_key")
-        if not ck:
-            raise RuntimeError("Binder MSA cache entry missing cache_key")
-        return {"source": "cache", "cache_key": ck}
+            }, None
+        return None, dep_for("binder", seq)
 
-    def target_msa_ref_for(name: str, seq: str) -> Dict[str, Any]:
+    def target_source(name: str, seq: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         if target_msa_source_n == "provided":
             pair = _target_msa_lookup(target_msa_map, name, seq)
             if not pair or not pair.get("non_pairing"):
                 raise RuntimeError(f"No provided target MSA found for target '{name}'")
-            return {
-                "source": "inline",
-                "pairing": pair.get("pairing"),
-                "non_pairing": pair.get("non_pairing"),
-            }
+            return {"source": "inline", "pairing": pair.get("pairing"), "non_pairing": pair.get("non_pairing")}, None
+        return None, dep_for("target", seq)
 
-        info = target_cache.get(seq, {})
-        if info.get("status") == "error":
-            raise RuntimeError(f"Target MSA fetch failed for target '{name}': {info.get('error')}")
-        if info.get("status") == "fetched_no_cache":
-            if not info.get("non_pairing"):
-                raise RuntimeError(f"Target MSA fetch returned no non_pairing content for '{name}'")
-            return {
-                "source": "inline",
-                "pairing": info.get("pairing"),
-                "non_pairing": info.get("non_pairing"),
-            }
-        ck = info.get("cache_key")
-        if not ck:
-            raise RuntimeError(f"Target MSA cache key missing for target '{name}'")
-        return {"source": "cache", "cache_key": ck}
-
-    def antitarget_msa_ref() -> Dict[str, Any]:
+    def antitarget_source() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         if antitarget_msa_source_n == "none":
-            return {"source": "none"}
+            return {"source": "none"}, None
         if antitarget_msa_source_n == "provided":
             return {
                 "source": "inline",
                 "pairing": antitarget_msa_inline.get("pairing") if antitarget_msa_inline else None,
                 "non_pairing": antitarget_msa_inline.get("non_pairing") if antitarget_msa_inline else None,
-            }
-        info = antitarget_cache.get(antitarget_seq, {})
-        if info.get("status") == "error":
-            raise RuntimeError(f"Antitarget MSA fetch failed: {info.get('error')}")
-        if info.get("status") == "fetched_no_cache":
-            if not info.get("non_pairing"):
-                raise RuntimeError("Antitarget MSA fetch returned no non_pairing content")
-            return {
-                "source": "inline",
-                "pairing": info.get("pairing"),
-                "non_pairing": info.get("non_pairing"),
-            }
-        ck = info.get("cache_key")
-        if not ck:
-            raise RuntimeError("Antitarget MSA cache key missing")
-        return {"source": "cache", "cache_key": ck}
+            }, None
+        return None, dep_for("antitarget", antitarget_seq)
 
-    # Build tasks.
     task_list: List[Dict[str, Any]] = []
     for row in pair_rows:
-        binder_ref = binder_msa_ref_for(row["binder_seq"])
-        target_ref = target_msa_ref_for(row["target_name"], row["target_seq"])
+        binder_static, binder_dep = binder_source(row["binder_seq"])
+        target_static, target_dep = target_source(row["target_name"], row["target_seq"])
 
         base_hash = _short_hash(f"{row['binder_name']}|{row['target_name']}|{row['row_index']}")
         pair_id = (
@@ -2526,8 +3005,15 @@ def run_pipeline(
             f"{_slugify(row['binder_name'])}__vs__{_slugify(row['target_name'])}__{base_hash}"
         )
 
-        def add_task(role: str, partner_name: str, partner_seq: str, partner_ref: Dict[str, Any]) -> None:
+        def add_task(
+            role: str,
+            partner_name: str,
+            partner_seq: str,
+            partner_static: Optional[Dict[str, Any]],
+            partner_dep: Optional[str],
+        ) -> None:
             task_id = f"{pair_id}__{role}"
+            deps = [x for x in [binder_dep, partner_dep] if x]
             task_list.append(
                 {
                     "task_id": task_id,
@@ -2540,8 +3026,11 @@ def run_pipeline(
                     "binder_seq": row["binder_seq"],
                     "target_name": row["target_name"],
                     "target_seq": row["target_seq"],
-                    "binder_msa_ref": binder_ref,
-                    "partner_msa_ref": partner_ref,
+                    "binder_msa_ref_static": binder_static,
+                    "partner_msa_ref_static": partner_static,
+                    "binder_dep_key": binder_dep,
+                    "partner_dep_key": partner_dep,
+                    "pending_dep_keys": deps,
                     "model_name": model_name,
                     "seeds_csv": seeds,
                     "n_sample": sample_diffusion_n_sample,
@@ -2553,76 +3042,285 @@ def run_pipeline(
                     "pae_cutoff": pae_cutoff,
                     "dist_cutoff": dist_cutoff,
                     "run_id": run_id,
-                    "stream_to_dict": stream,
                     "stream_logs": stream_logs,
                     "log_chunk_seconds": log_chunk_seconds,
                     "heartbeat_seconds": heartbeat_seconds,
+                    "scheduler_state": "blocked_msa" if deps else "ready",
+                    "exec_state": "pending",
+                    "attempt": 1,
+                    "lease_epoch": 0,
+                    "lease_owner": None,
+                    "lease_expires_at": None,
                 }
             )
 
-        add_task("target", row["target_name"], row["target_seq"], target_ref)
+        add_task("target", row["target_name"], row["target_seq"], target_static, target_dep)
 
         if include_antitarget:
-            add_task(
-                "antitarget",
-                antitarget_name,
-                antitarget_seq,
-                antitarget_msa_ref(),
-            )
+            anti_static, anti_dep = antitarget_source()
+            add_task("antitarget", antitarget_name, antitarget_seq, anti_static, anti_dep)
 
         if include_self:
-            add_task("self", row["binder_name"], row["binder_seq"], {"source": "none"})
+            add_task("self", row["binder_name"], row["binder_seq"], {"source": "none"}, None)
 
-    effective_run_id = run_id or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    if stream:
-        for task in task_list:
-            task["run_id"] = effective_run_id
+    meta_path = output_root / "run_metadata.json"
+    prior_meta: Optional[Dict[str, Any]] = None
+    if meta_path.exists():
+        try:
+            prior_meta = _load_json(meta_path)
+        except Exception:  # noqa: BLE001
+            prior_meta = None
 
-    print("\n" + "=" * 78)
-    print("PROTENIX + ipSAE PIPELINE (Modal)")
-    print("=" * 78)
-    print(f"Pair rows: {len(pair_rows)}")
-    print(f"Tasks: {len(task_list)}")
-    print(f"Binder mode: {binder_mode_n}")
-    print(f"Target MSA source: {target_msa_source_n}")
-    print(f"MSA host: {host_url}")
-    print(f"MSA host policy: {mmseqs_host_policy}")
-    print(f"MSA cache mode: {mmseqs_cache_mode} (store_alias={mmseqs_store_fetched_msas})")
-    print(f"Model: {model_name}")
-    print(f"Seeds: {seeds}")
-    print(f"N_sample: {sample_diffusion_n_sample}")
-    print(f"Best scope: {scope_n}")
-    print(f"GPU: {gpu}")
-    print(f"Max parallel: {max_parallel}")
-    print(f"Output dir: {output_root}")
-    if stream:
-        print(f"Streaming: ENABLED (run_id={effective_run_id})")
-        print(
-            f"Stream logs: {'ENABLED' if stream_logs else 'DISABLED'} "
-            f"(chunk={log_chunk_seconds:.1f}s, heartbeat={heartbeat_seconds:.1f}s)"
-        )
+    if run_id:
+        effective_run_id = run_id
+    elif resume_n != "never" and isinstance(prior_meta, dict) and prior_meta.get("run_id"):
+        effective_run_id = str(prior_meta.get("run_id"))
     else:
-        print("Streaming: DISABLED")
-    print("=" * 78 + "\n")
+        effective_run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    for task in task_list:
+        task["run_id"] = effective_run_id
 
-    print("Running dependency/runtime preflight...")
+    critical_flags = {
+        "binder_mode": binder_mode_n,
+        "target_msa_source": target_msa_source_n,
+        "include_antitarget": bool(include_antitarget),
+        "antitarget_msa_source": antitarget_msa_source_n,
+        "include_self": bool(include_self),
+        "mmseqs_mode": "colabfold",
+        "mmseqs_host_url": host_url,
+        "mmseqs_db_tag": mmseqs_db_tag,
+        "mmseqs_pairing_strategy": mmseqs_pairing_strategy,
+        "model_name": model_name,
+        "seeds": seeds,
+        "sample_diffusion_n_sample": sample_diffusion_n_sample,
+        "sample_diffusion_n_step": sample_diffusion_n_step,
+        "n_cycle": n_cycle,
+        "best_sample_scope": scope_n,
+    }
+    task_manifest_hash = _manifest_hash(task_list, critical_flags)
+    if resume_n != "never" and meta_path.exists():
+        old_meta = _load_json(meta_path)
+        old_hash = str(old_meta.get("task_manifest_hash", ""))
+        if old_hash and old_hash != task_manifest_hash and not resume_manifest_override:
+            raise RuntimeError(
+                "Resume manifest mismatch detected. Use --resume-manifest-override true to bypass."
+            )
+
+    _log("\n" + "=" * 78)
+    _log("PROTENIX + ipSAE PIPELINE (Modal)")
+    _log("=" * 78)
+    _log(f"Pair rows: {len(pair_rows)}")
+    _log(f"Tasks: {len(task_list)}")
+    _log(f"MSA deps: {len(dep_requests)} unique")
+    _log(f"Binder mode: {binder_mode_n}")
+    _log(f"Target MSA source: {target_msa_source_n}")
+    _log(f"MSA host: {host_url}")
+    _log(f"MSA host policy: {mmseqs_host_policy}")
+    _log(f"MSA cache mode: {mmseqs_cache_mode} (store_alias={mmseqs_store_fetched_msas})")
+    _log(f"MSA context hash: {context_hash}")
+    _log(f"Model: {model_name}")
+    _log(f"Seeds: {seeds}")
+    _log(f"N_sample: {sample_diffusion_n_sample}")
+    _log(f"Best scope: {scope_n}")
+    _log(f"GPU: {gpu}")
+    _log(f"Max parallel: {max_parallel}")
+    _log(f"Resume mode: {resume_n} (retry_errors={retry_errors})")
+    _log(f"Output dir: {output_root}")
+    _log(f"Streaming: ENABLED (run_id={effective_run_id})")
+    _log("=" * 78 + "\n")
+
+    _log("Running dependency/runtime preflight...")
     preflight = preflight_protenix_runtime.remote(model_name)
-    print(f"Preflight: {preflight}")
+    _log(f"Preflight: {preflight}")
 
     configured_fn = GPU_FUNCTIONS[gpu]
 
+    def existing_result_for(task: Dict[str, Any], default_status: str) -> Dict[str, Any]:
+        pair_id = task["pair_id"]
+        role = task["partner_role"]
+        metrics_path = _pair_role_paths(output_root, pair_id, role)["metrics"]
+        if metrics_path.exists():
+            try:
+                out = _load_json(metrics_path)
+                out["status"] = out.get("status", default_status)
+                return out
+            except Exception:  # noqa: BLE001
+                pass
+        return {
+            "status": default_status,
+            "task_id": task["task_id"],
+            "pair_id": task["pair_id"],
+            "row_index": task["row_index"],
+            "partner_role": task["partner_role"],
+            "partner_name": task["partner_name"],
+            "binder_name": task["binder_name"],
+            "binder_seq": task["binder_seq"],
+            "target_name": task["target_name"],
+            "target_seq": task["target_seq"],
+            "selection_scope": task["best_sample_scope"],
+            "error": None if default_status == "success" else "skipped",
+        }
+
+    def parse_iso_ts(value: Any) -> float:
+        if not isinstance(value, str) or not value:
+            return 0.0
+        try:
+            return datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    now_ts = time.time()
+    stale_cutoff_s = stale_running_minutes * 60
+    runnable: List[Dict[str, Any]] = []
+    results: List[Dict[str, Any]] = []
+
+    for task in task_list:
+        pair_id = task["pair_id"]
+        role = task["partner_role"]
+        status_path = _task_status_path(output_root, pair_id, role)
+        prev = _load_task_status(status_path)
+
+        if resume_n == "never" or overwrite_existing or prev is None:
+            runnable.append(task)
+            continue
+
+        exec_state = str(prev.get("exec_state", "pending"))
+        req_ok = all(p.exists() for p in _required_success_files(output_root, pair_id, role))
+        if exec_state == "success" and req_ok and not overwrite_existing:
+            results.append(existing_result_for(task, "success"))
+            continue
+
+        if exec_state == "error" and not retry_errors:
+            results.append(existing_result_for(task, "error"))
+            continue
+
+        task["attempt"] = int(prev.get("attempt", 1)) + 1
+        task["lease_epoch"] = int(prev.get("lease_epoch", 0)) + 1
+        if exec_state == "running":
+            updated_at = parse_iso_ts(prev.get("updated_at"))
+            lease_exp = float(prev.get("lease_expires_at") or 0.0)
+            is_stale = (updated_at and (now_ts - updated_at) > stale_cutoff_s) or (lease_exp and lease_exp < now_ts)
+            if not is_stale and resume_n == "auto":
+                task["attempt"] = int(prev.get("attempt", 1))
+                task["lease_epoch"] = int(prev.get("lease_epoch", 0)) + 1
+        runnable.append(task)
+
+    task_lookup: Dict[str, Dict[str, Any]] = {t["task_id"]: t for t in runnable}
+    dep_waiters: Dict[str, set[str]] = {}
+    for task in runnable:
+        deps = list(task.get("pending_dep_keys") or [])
+        task["_unmet_deps"] = set(deps)
+        task["scheduler_state"] = "blocked_msa" if deps else "ready"
+        for dkey in deps:
+            dep_waiters.setdefault(dkey, set()).add(task["task_id"])
+        p = _pair_role_paths(output_root, task["pair_id"], task["partner_role"])
+        p["pair_dir"].mkdir(parents=True, exist_ok=True)
+        _atomic_save_json(
+            p["pair_json"],
+            {
+                "pair_id": task["pair_id"],
+                "row_index": task["row_index"],
+                "binder_name": task["binder_name"],
+                "binder_seq": task["binder_seq"],
+                "target_name": task["target_name"],
+                "target_seq": task["target_seq"],
+            },
+        )
+        _merge_status_file(
+            p["status"],
+            {
+                "task_id": task["task_id"],
+                "pair_id": task["pair_id"],
+                "role": task["partner_role"],
+                "scheduler_state": task["scheduler_state"],
+                "exec_state": "pending",
+                "attempt": int(task["attempt"]),
+                "lease_epoch": int(task["lease_epoch"]),
+                "lease_owner": None,
+                "lease_expires_at": None,
+                "stage": "msa_prepare" if deps else "ready",
+            },
+        )
+
     sync_thread = None
     stop_sync = None
-    if stream:
-        stop_sync = threading.Event()
-        sync_thread = threading.Thread(
-            target=_sync_worker,
-            args=(effective_run_id, output_root, stop_sync, sync_interval),
-            daemon=True,
-        )
-        sync_thread.start()
+    stop_sync = threading.Event()
+    sync_thread = threading.Thread(
+        target=_sync_worker,
+        args=(effective_run_id, output_root, stop_sync, sync_interval),
+        daemon=True,
+    )
+    sync_thread.start()
 
-    results: List[Dict[str, Any]] = []
+    ready_q: deque[str] = deque([t["task_id"] for t in runnable if not t.get("_unmet_deps")])
+    pending_ids: set[str] = {t["task_id"] for t in runnable}
+    dep_state: Dict[str, Dict[str, Any]] = {}
+    dep_seen_at = {k: time.time() for k in dep_waiters.keys()}
+    dep_updates: "queue.Queue[Tuple[str, bool, Any]]" = queue.Queue()
+    stop_resolver = threading.Event()
+    dep_total = len(dep_waiters)
+    dep_started: set[str] = set()
+
+    def resolver_loop() -> None:
+        while not stop_resolver.is_set():
+            unresolved = [k for k in dep_waiters.keys() if k not in dep_state]
+            if not unresolved:
+                _log("[MSA] dependency resolver complete")
+                return
+            unresolved.sort(
+                key=lambda k: (
+                    -len(dep_waiters.get(k, set())),
+                    dep_seen_at.get(k, 0.0),
+                    k,
+                )
+            )
+            dep_key = unresolved[0]
+            req = dep_requests.get(dep_key)
+            if not req:
+                dep_state[dep_key] = {"state": "error", "error": "missing dep request"}
+                dep_updates.put((dep_key, False, "missing dependency request"))
+                continue
+
+            try:
+                role = str(req.get("role", "unknown"))
+                seq = str(req["sequence"])
+                seq_hash = _short_hash(seq, n=10)
+                dep_started.add(dep_key)
+                _log(
+                    f"[MSA] resolving dep {len(dep_started)}/{max(dep_total,1)} role={role} "
+                    f"seq={seq_hash} waiters={len(dep_waiters.get(dep_key, set()))}"
+                )
+                _acquire_global_msa_submit_slot(msa_global_rate_key, msa_min_submit_interval_s)
+                info_map = precompute_msas.remote(
+                    sequences=[seq],
+                    role=str(req["role"]),
+                    host_url=host_url,
+                    cache_mode=mmseqs_cache_mode,
+                    store_fetched_msas=mmseqs_store_fetched_msas,
+                    msa_mode="colabfold",
+                    pairing_strategy=mmseqs_pairing_strategy,
+                    db_tag=mmseqs_db_tag,
+                )
+                info = info_map.get(_normalize_sequence(seq), {"status": "error", "error": "missing result"})
+                msa_ref = _msa_ref_from_fetch_info(info)
+                dep_state[dep_key] = {"state": "resolved", "msa_ref": msa_ref}
+                dep_updates.put((dep_key, True, msa_ref))
+                _log(
+                    f"[MSA] resolved role={role} seq={seq_hash} status={info.get('status')} "
+                    f"resolved={sum(1 for x in dep_state.values() if x.get('state') == 'resolved')}/{max(dep_total,1)}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                dep_state[dep_key] = {"state": "error", "error": str(exc)}
+                dep_updates.put((dep_key, False, str(exc)))
+                _log(f"[MSA] failed dep={dep_key} err={str(exc)[:180]}")
+
+    resolver_thread = None
+    if dep_waiters:
+        _log(f"[MSA] starting resolver for {len(dep_waiters)} dependencies")
+        resolver_thread = threading.Thread(target=resolver_loop, daemon=True)
+        resolver_thread.start()
+    else:
+        _log("[MSA] no dependencies to resolve")
 
     def run_safe(t: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -2640,49 +3338,286 @@ def run_pipeline(
                 "target_name": t["target_name"],
                 "target_seq": t["target_seq"],
                 "selection_scope": t["best_sample_scope"],
+                "attempt": int(t.get("attempt", 1)),
+                "lease_epoch": int(t.get("lease_epoch", 0)),
                 "error": str(exc),
             }
 
-    print(f"Submitting {len(task_list)} task(s)...")
-    with ThreadPoolExecutor(max_workers=max_parallel) as ex:
-        futs = {ex.submit(run_safe, t): t for t in task_list}
-        for i, fut in enumerate(as_completed(futs), start=1):
-            res = fut.result()
+    _log(f"Scheduling {len(runnable)} runnable task(s) with dependency-gated MSA resolver...")
+    n_started = 0
+    running: Dict[Any, str] = {}
+    started_at: Dict[str, float] = {}
+    tasks_dispatched = 0
+    run_started_at = time.time()
+    last_progress_at = run_started_at
+    last_scheduler_log_at = run_started_at
+    all_task_lookup: Dict[str, Dict[str, Any]] = {t["task_id"]: t for t in task_list}
+
+    def make_error_result(task: Dict[str, Any], error_msg: str) -> Dict[str, Any]:
+        return {
+            "status": "error",
+            "task_id": task["task_id"],
+            "pair_id": task["pair_id"],
+            "row_index": task["row_index"],
+            "partner_role": task["partner_role"],
+            "partner_name": task["partner_name"],
+            "binder_name": task["binder_name"],
+            "binder_seq": task["binder_seq"],
+            "target_name": task["target_name"],
+            "target_seq": task["target_seq"],
+            "selection_scope": task["best_sample_scope"],
+            "attempt": int(task.get("attempt", 1)),
+            "lease_epoch": int(task.get("lease_epoch", 0)),
+            "error": str(error_msg),
+        }
+
+    def terminalize_pending(reason: str) -> int:
+        n = 0
+        for tid in list(pending_ids):
+            task = task_lookup[tid]
+            res = make_error_result(task, reason)
             results.append(res)
-            status = res.get("status", "error")
-            task_id = res.get("task_id", "unknown")
-            if status == "success":
-                print(f"[{i}/{len(task_list)}] ✓ {task_id} ipTM={res.get('best_iptm', -1):.4f}")
+            _save_task_result(output_root, res)
+            pending_ids.remove(tid)
+            n += 1
+        return n
+
+    with ThreadPoolExecutor(max_workers=max_parallel) as ex:
+        dispatch_budget_exhausted = False
+        while pending_ids or running or (resolver_thread is not None and resolver_thread.is_alive()):
+            while True:
+                try:
+                    dep_key, ok, payload = dep_updates.get_nowait()
+                except queue.Empty:
+                    break
+                waiters = list(dep_waiters.get(dep_key, set()))
+                for tid in waiters:
+                    if tid not in pending_ids:
+                        continue
+                    task = task_lookup[tid]
+                    if not ok:
+                        err = str(payload)
+                        res = make_error_result(task, f"MSA dependency failed ({dep_key}): {err}")
+                        results.append(res)
+                        pending_ids.remove(tid)
+                        _save_task_result(output_root, res)
+                        last_progress_at = time.time()
+                        _log(f"[MSA-ERROR] {tid} -> {err[:120]}")
+                        continue
+                    task["_unmet_deps"].discard(dep_key)
+                    if not task["_unmet_deps"] and task.get("scheduler_state") != "ready":
+                        task["scheduler_state"] = "ready"
+                        ready_q.append(tid)
+                        last_progress_at = time.time()
+                        _merge_status_file(
+                            _task_status_path(output_root, task["pair_id"], task["partner_role"]),
+                            {"scheduler_state": "ready", "exec_state": "pending", "stage": "ready"},
+                        )
+
+            now = time.time()
+            for tid, st in list(started_at.items()):
+                if now - st >= lease_heartbeat_interval_s and tid in pending_ids:
+                    task = task_lookup[tid]
+                    lease_exp = now + lease_timeout_s
+                    task["lease_expires_at"] = lease_exp
+                    _merge_status_file(
+                        _task_status_path(output_root, task["pair_id"], task["partner_role"]),
+                        {"lease_expires_at": lease_exp, "exec_state": "running", "scheduler_state": "leased"},
+                    )
+                    started_at[tid] = now
+                    last_progress_at = now
+
+            if now - last_scheduler_log_at >= 15.0:
+                unresolved_deps = sum(1 for k in dep_waiters.keys() if k not in dep_state)
+                resolved_deps = sum(1 for v in dep_state.values() if v.get("state") == "resolved")
+                _log(
+                    f"[SCHED] pending={len(pending_ids)} ready={len(ready_q)} running={len(running)} "
+                    f"deps={resolved_deps}/{max(dep_total,1)} unresolved={unresolved_deps}"
+                )
+                last_scheduler_log_at = now
+
+            while len(running) < max_parallel and ready_q:
+                if worker_max_tasks > 0 and tasks_dispatched >= worker_max_tasks:
+                    dispatch_budget_exhausted = True
+                    break
+                tid = ready_q.popleft()
+                if tid not in pending_ids:
+                    continue
+                task = task_lookup[tid]
+                if task.get("_unmet_deps"):
+                    continue
+
+                task["lease_owner"] = f"local-{os.getpid()}-{threading.get_ident()}"
+                if int(task.get("lease_epoch", 0)) <= 0:
+                    task["lease_epoch"] = 1
+                lease_exp = time.time() + lease_timeout_s
+                task["lease_expires_at"] = lease_exp
+                task["scheduler_state"] = "leased"
+                task["exec_state"] = "running"
+
+                binder_ref = task.get("binder_msa_ref_static")
+                if binder_ref is None:
+                    dep = task.get("binder_dep_key")
+                    binder_ref = dep_state.get(dep, {}).get("msa_ref")
+                partner_ref = task.get("partner_msa_ref_static")
+                if partner_ref is None:
+                    dep = task.get("partner_dep_key")
+                    partner_ref = dep_state.get(dep, {}).get("msa_ref")
+                if binder_ref is None or partner_ref is None:
+                    task["scheduler_state"] = "blocked_msa"
+                    ready_q.appendleft(tid)
+                    break
+
+                payload = dict(task)
+                payload["binder_msa_ref"] = binder_ref
+                payload["partner_msa_ref"] = partner_ref
+                fut = ex.submit(run_safe, payload)
+                running[fut] = tid
+                started_at[tid] = time.time()
+                n_started += 1
+                tasks_dispatched += 1
+                last_progress_at = time.time()
+                _merge_status_file(
+                    _task_status_path(output_root, task["pair_id"], task["partner_role"]),
+                    {
+                        "scheduler_state": "leased",
+                        "exec_state": "running",
+                        "attempt": int(task["attempt"]),
+                        "lease_epoch": int(task["lease_epoch"]),
+                        "lease_owner": task["lease_owner"],
+                        "lease_expires_at": lease_exp,
+                        "stage": "inference",
+                    },
+                )
+
+            if running:
+                done, _ = wait(set(running.keys()), timeout=1.0, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    tid = running.pop(fut)
+                    started_at.pop(tid, None)
+                    task = task_lookup[tid]
+                    try:
+                        res = fut.result()
+                    except Exception as exc:  # noqa: BLE001
+                        res = {
+                            "status": "error",
+                            "task_id": tid,
+                            "pair_id": task["pair_id"],
+                            "row_index": task["row_index"],
+                            "partner_role": task["partner_role"],
+                            "partner_name": task["partner_name"],
+                            "binder_name": task["binder_name"],
+                            "binder_seq": task["binder_seq"],
+                            "target_name": task["target_name"],
+                            "target_seq": task["target_seq"],
+                            "selection_scope": task["best_sample_scope"],
+                            "attempt": int(task.get("attempt", 1)),
+                            "lease_epoch": int(task.get("lease_epoch", 1)),
+                            "error": str(exc),
+                        }
+                    results.append(res)
+                    pending_ids.discard(tid)
+                    task["scheduler_state"] = "done"
+                    task["exec_state"] = "success" if res.get("status") == "success" else "error"
+                    last_progress_at = time.time()
+                    if res.get("status") == "success":
+                        _log(f"[{len(results)}/{len(task_list)}] ✓ {tid} ipTM={res.get('best_iptm', -1):.4f}")
+                    else:
+                        _log(f"[{len(results)}/{len(task_list)}] ✗ {tid} {str(res.get('error','error'))[:120]}")
+                    _save_task_result(output_root, res)
             else:
-                print(f"[{i}/{len(task_list)}] ✗ {task_id} {str(res.get('error', 'error'))[:120]}")
+                if pending_ids and not ready_q and (resolver_thread is None or not resolver_thread.is_alive()):
+                    terminalize_pending("Task remained blocked after MSA resolver completed")
+                    last_progress_at = time.time()
+                if not pending_ids and (resolver_thread is None or not resolver_thread.is_alive()):
+                    break
+                time.sleep(0.2)
+
+            loop_now = time.time()
+            if dispatch_budget_exhausted and not running:
+                terminalize_pending("worker_max_tasks limit reached before all tasks were dispatched")
+                break
+            if (loop_now - run_started_at) > worker_max_runtime_s and not running:
+                terminalize_pending("worker_max_runtime_s reached before all pending tasks completed")
+                break
+            if (
+                (loop_now - last_progress_at) > worker_idle_timeout_s
+                and not running
+                and pending_ids
+                and not ready_q
+                and (resolver_thread is None or not resolver_thread.is_alive())
+            ):
+                terminalize_pending("worker_idle_timeout_s reached with no schedulable work")
+                break
+
+    stop_resolver.set()
+    if resolver_thread is not None:
+        resolver_thread.join(timeout=10)
 
     if sync_thread is not None and stop_sync is not None:
         stop_sync.set()
         sync_thread.join(timeout=30)
 
-    # Persist all results (also covers no-stream mode).
-    for r in results:
-        _save_task_result(output_root, r)
+    # Invariant: exactly one terminal result row per planned task id.
+    result_by_task_id: Dict[str, Dict[str, Any]] = {}
+    for res in results:
+        tid = str(res.get("task_id", ""))
+        if tid:
+            result_by_task_id[tid] = res
 
+    if len(result_by_task_id) < len(task_list):
+        missing_ids = [t["task_id"] for t in task_list if t["task_id"] not in result_by_task_id]
+        for tid in missing_ids:
+            task = all_task_lookup.get(tid)
+            if task is None:
+                continue
+            synthesized = make_error_result(
+                task,
+                "Task missing terminal result; synthesized by scheduler invariant check",
+            )
+            result_by_task_id[tid] = synthesized
+            _save_task_result(output_root, synthesized)
+
+    results = [result_by_task_id[t["task_id"]] for t in task_list if t["task_id"] in result_by_task_id]
     csv_path = _write_summary_csv(output_root, results)
 
+    n_success = sum(1 for r in results if r.get("status") == "success")
+    n_fail = len(results) - n_success
+    if len(results) < len(task_list):
+        run_status = "incomplete"
+    elif n_fail > 0:
+        run_status = "complete_with_errors"
+    else:
+        run_status = "complete_success"
     metadata = {
         "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
         "run_id": effective_run_id,
         "pair_csv": str(pair_csv),
         "num_rows": len(pair_rows),
-        "num_tasks": len(task_list),
+        "num_tasks_total": len(task_list),
+        "num_tasks_started": int(n_started),
+        "num_tasks_dispatched": int(tasks_dispatched),
+        "num_tasks_returned": len(results),
+        "num_tasks_unique_returned": len(result_by_task_id),
+        "run_status": run_status,
+        "task_manifest_hash": task_manifest_hash,
+        "resume_mode": resume_n,
+        "resume_manifest_override": bool(resume_manifest_override),
         "binder_mode": binder_mode_n,
         "target_msa_source": target_msa_source_n,
         "include_antitarget": bool(include_antitarget),
-        "antitarget_input_mode": antitarget_input_mode,
-        "antitarget_csv": str(antitarget_csv) if antitarget_csv else None,
         "include_self": bool(include_self),
         "mmseqs_mode": "colabfold",
         "mmseqs_host_url": host_url,
         "mmseqs_host_policy": mmseqs_host_policy,
         "mmseqs_cache_mode": mmseqs_cache_mode,
         "mmseqs_store_fetched_msas": bool(mmseqs_store_fetched_msas),
+        "mmseqs_db_tag": mmseqs_db_tag,
+        "mmseqs_pairing_strategy": mmseqs_pairing_strategy,
+        "msa_context_hash": context_hash,
+        "msa_min_submit_interval_s": float(msa_min_submit_interval_s),
+        "msa_global_rate_key": str(msa_global_rate_key),
+        "msa_max_inflight": int(msa_max_inflight),
         "model_name": model_name,
         "seeds": seeds,
         "sample_diffusion_n_sample": sample_diffusion_n_sample,
@@ -2691,16 +3626,16 @@ def run_pipeline(
         "best_sample_scope": scope_n,
         "gpu": gpu,
         "max_parallel": max_parallel,
+        "worker_max_runtime_s": worker_max_runtime_s,
+        "worker_max_tasks": worker_max_tasks,
+        "worker_idle_timeout_s": worker_idle_timeout_s,
+        "lease_timeout_s": lease_timeout_s,
+        "lease_heartbeat_interval_s": lease_heartbeat_interval_s,
         "stream_logs": bool(stream_logs),
         "log_chunk_seconds": float(log_chunk_seconds),
         "heartbeat_seconds": float(heartbeat_seconds),
     }
-
-    meta_path = output_root / "summaries" / "run_metadata.json"
-    _save_json(meta_path, metadata)
-
-    n_success = sum(1 for r in results if r.get("status") == "success")
-    n_fail = len(results) - n_success
+    _atomic_save_json(meta_path, metadata)
 
     print("\n" + "=" * 78)
     print("SUMMARY")

@@ -13,7 +13,7 @@ This repository now centers on:
 The pipeline is row-centric:
 
 1. Read a pair CSV where each row is one binder-target pair.
-2. Run Protenix for each row (plus optional antitarget/self tasks).
+2. Resolve required MSAs per-task (dependency-gated, non-blocking), then run Protenix for ready rows.
 3. Select the best structure by highest `iptm` (`global` or `per_seed` scope).
 4. Run ipSAE on the selected structure using a compatibility adapter.
 5. Write per-task outputs plus a run summary CSV.
@@ -166,14 +166,37 @@ Lookup priority is: `(name + sequence)` -> `sequence` -> `name`.
 
 - `--gpu <type>` (default: `A100-80GB`)
 - `--max-parallel <int>` (default: `1`)
-  - This is the concurrency knob for inference task fanout.
-  - Set `--max-parallel 1` for strict single-container execution.
-- `--no-stream <bool>` (default: `false`, streaming enabled by default)
+  - Max concurrent inference task executions.
+- Streaming is always enabled for this pipeline.
 - `--stream-logs <bool>` (default: `true`)
 - `--log-chunk-seconds <float>` (default: `1.0`)
 - `--heartbeat-seconds <float>` (default: `15.0`)
 - `--run-id <id>` (optional)
 - `--sync-interval <seconds>` (default: `5.0`)
+
+### Resume + lease controls
+
+- `--resume {auto,always,never}` (default: `auto`)
+- `--retry-errors <bool>` (default: `true`)
+- `--stale-running-minutes <int>` (default: `30`)
+- `--overwrite-existing <bool>` (default: `false`)
+- `--resume-manifest-override <bool>` (default: `false`)
+- `--lease-timeout-s <int>` (default: `900`)
+- `--lease-heartbeat-interval-s <int>` (default: `60`)
+
+### Worker lifecycle controls
+
+- `--worker-max-runtime-s <int>` (default: `6800`)
+- `--worker-max-tasks <int>` (default: `0`, disabled)
+  - Max number of task dispatches from this local scheduler process before pending tasks are terminalized.
+- `--worker-idle-timeout-s <int>` (default: `120`)
+  - If no scheduler progress occurs and nothing is runnable, pending tasks are terminalized after this timeout.
+
+### MSA scheduler controls
+
+- `--msa-min-submit-interval-s <float>` (default: `1.0`)
+- `--msa-global-rate-key <str>` (default: `protenix_msa_global`)
+- `--msa-max-inflight <int>` (currently must be `1`)
 
 ### Long-run reliability
 
@@ -221,42 +244,29 @@ modal run modal_protenix_batch.py::test_connection --gpu A100-80GB
 
 ```text
 <output_dir>/
-  _stream/
-    <run_id>/
-      events.jsonl
-      logs/
-        <task_id>.log
-        <task_id>.stdout.log
-        <task_id>.stderr.log
-      status/
-        <task_id>.json
-      artifacts/
-        <task_id>/
-          seed_<seed>/sample_<sample_rank>/
-            sample.cif
-            summary_confidence.json
-            full_data.json
-          best/
-            best_sample.cif
-            best_summary_confidence.json
-            best_full_data.json
-  pair_runs/
+  run_metadata.json
+  pair_summary.csv
+  events.jsonl
+  logs/
+    <task_id>.log
+    <task_id>.stdout.log
+    <task_id>.stderr.log
+  pairs/
     <pair_id>/
-      target|antitarget|self/
-        input.json
-        metrics.json
-        best/
-          best_sample.cif
-          best_summary_confidence.json
-        ipsae/
-          best_sample_ipsae.txt
-          ipsae_metrics.json
-  best_by_target/
+      pair.json
+      target.status.json
+      target.metrics.json
+      target.best.cif
+      target.best_summary.json
+      target.ipsae.json
+      target.candidates/
+        s<seed>_n<rank>.cif
+        s<seed>_n<rank>.summary.json
+        s<seed>_n<rank>.full_data.json
+      antitarget.* / self.* (when enabled)
+  by_target/
     <target_slug>/
       <binder_slug>__vs__<target_slug>__<short_hash>.cif
-  summaries/
-    pair_summary.csv
-    run_metadata.json
 ```
 
 `pair_summary.csv` columns:
@@ -274,6 +284,9 @@ modal run modal_protenix_batch.py::test_connection --gpu A100-80GB
 ## Notes
 
 - Target MSA is enforced per target task.
+- MSA fetching is dependency-gated and non-blocking: inference starts as soon as any task becomes ready.
+- Streaming artifacts and logs are written incrementally during task execution.
+- `run_metadata.json` includes `run_status` as one of: `complete_success`, `complete_with_errors`, `incomplete`.
 - `fixed_msa` mode performs warn-only compatibility checks against binder sequences.
 - Best-structure selection is based on highest `iptm`.
-- `run_metadata.json` captures key run configuration for reproducibility.
+- `run_metadata.json` captures key run configuration and run-level status for reproducibility.
