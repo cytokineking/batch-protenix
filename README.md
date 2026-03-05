@@ -1,22 +1,39 @@
 # Protenix Modal Batch Pipeline
 
-Batch protein interface prediction pipeline on Modal using Protenix v1 + ipSAE scoring.
+This repository provides a production-style Modal pipeline for large batch binder-target
+screening with Protenix v1, plus ipSAE post-scoring for interface quality analysis.
 
-This repository now centers on:
+It is designed for long-running, restartable batch jobs where you want:
+
+- GPU-parallel structure prediction across many binder-target rows.
+- Flexible MSA backends (`colabfold` API or local MMseqs2 GPU mode).
+- Incremental streaming of logs/artifacts during execution.
+- Resume-safe behavior after interruption or disconnects.
+
+Core files:
 
 - `modal_protenix_batch.py` - Modal cloud pipeline entrypoints.
+- `modal_build_uniref100_db.py` - standalone detached bootstrap utility for local MMseqs UniRef100 volumes.
 - `ipsae.py` - ipSAE scorer used after Protenix inference.
-- `Protenix/` - local Protenix checkout embedded into the Modal image.
+- Protenix + MMseqs2 are cloned into the Modal image at build time (pinned refs).
 
 ## Overview
 
-The pipeline is row-centric:
+The pipeline is row-centric and dependency-gated:
 
-1. Read a pair CSV where each row is one binder-target pair.
-2. Resolve required MSAs per-task (dependency-gated, non-blocking), then run Protenix for ready rows.
-3. Select the best structure by highest `iptm` (`global` or `per_seed` scope).
-4. Run ipSAE on the selected structure using a compatibility adapter.
-5. Write per-task outputs plus a run summary CSV.
+1. Parse `--pair-csv` where each row defines one binder-target task.
+2. Resolve MSA dependencies for each task (without blocking unrelated ready tasks).
+3. Dispatch Protenix inference in parallel as soon as each task becomes runnable.
+4. Select best sample by top `iptm` (`global` or `per_seed` policy).
+5. Run ipSAE on the selected candidate through a Protenix-to-ipSAE adapter.
+6. Stream status/log/events during run; write structured outputs and summaries.
+7. Support resume/retry workflows for interrupted runs.
+
+Pipeline paradigm:
+
+- This is a pairwise interface pipeline, not a monomer-only pipeline.
+- Each CSV row is treated as a complex prediction request (`binder` vs `target`).
+- Optional `antitarget`/`self` tasks add extra partner contexts for the same binder, but do not replace the required binder-target row.
 
 ## Prerequisites
 
@@ -31,7 +48,11 @@ modal token new
 
 - `modal_protenix_batch.py`
 - `ipsae.py`
-- `Protenix/`
+
+Optional override env vars for image source refs:
+
+- `PROTENIX_GIT_URL`, `PROTENIX_GIT_REF`
+- `MMSEQS2_GIT_URL`, `MMSEQS2_GIT_REF`
 
 ## Main Command
 
@@ -47,6 +68,14 @@ modal run modal_protenix_batch.py::run_pipeline --help
 2. binder sequence
 3. target name
 4. target sequence
+
+Rows missing any of these four fields are skipped.
+If no valid rows remain, the run fails fast.
+
+Single-protein predictions:
+
+- A true monomer-only mode is not currently supported in this pipeline.
+- You must provide both binder and target fields for each row.
 
 Example:
 
@@ -96,6 +125,54 @@ modal run modal_protenix_batch.py::run_pipeline \
   --mmseqs-host-url https://api.colabfold.com
 ```
 
+### 3) Local MMseqs GPU backend (optional)
+
+Initialize local UniRef100 MMseqs DB once (quick path):
+
+```bash
+modal run modal_protenix_batch.py::init_mmseqs_uniref100_db \
+  --db-tag uniref100_v1 \
+  --db-profile uniref100_only
+```
+
+Or use the standalone bootstrap utility (recommended for long detached builds and explicit volume targeting):
+
+```bash
+modal run --detach modal_build_uniref100_db.py \
+  --volume-name mmseqs-uniref100-db \
+  --tmp-volume-name mmseqs-tmp
+```
+
+For parallel/backfill bootstrap, target a second volume:
+
+```bash
+modal run --detach modal_build_uniref100_db.py \
+  --volume-name mmseqs-uniref100-db-2 \
+  --tmp-volume-name mmseqs-tmp-2
+```
+
+Notes:
+
+- Bootstrap is storage-heavy. Default guardrails require large free space (default `--min-required-gb 300`, plus safety margin) and temp free space (default `--tmp-min-free-gb 20`).
+- Current supported local DB profile is `uniref100_only` (`uniref100_plus_env` is intentionally fail-fast for now).
+- `modal_build_uniref100_db.py` is a standalone app/bootstrap path and does not interfere with `run_pipeline` orchestration.
+
+Then run pipeline in local mode:
+
+```bash
+modal run modal_protenix_batch.py::run_pipeline \
+  --pair-csv ./pairs.csv \
+  --output-dir ./results_local_gpu \
+  --binder-mode full_msa \
+  --target-msa-source mmseqs \
+  --mmseqs-mode local_gpu \
+  --mmseqs-db-tag uniref100_v1 \
+  --mmseqs-local-gpu A100-80GB \
+  --mmseqs-local-workers 1 \
+  --mmseqs-local-batch-size 8 \
+  --inference-max-batch-size 8
+```
+
 ## CLI Reference (`run_pipeline`)
 
 ### Core inputs
@@ -135,8 +212,10 @@ Lookup priority is: `(name + sequence)` -> `sequence` -> `name`.
 
 ### MMseqs/ColabFold controls
 
-- `--mmseqs-mode colabfold` (only supported mode)
+- `--mmseqs-mode {colabfold,local_gpu}`
 - `--mmseqs-host-url <url>`
+  - Required for `colabfold` mode.
+  - In `local_gpu` mode, only needed when `--mmseqs-fallback colabfold` is enabled (or when explicitly forcing host resolution).
 - `--mmseqs-host-policy {strict,allow-default}` (default: `strict`)
   - `strict`: host URL is required and must match allowlist policy.
   - `allow-default`: if no host URL is given, defaults to `https://api.colabfold.com`.
@@ -145,7 +224,31 @@ Lookup priority is: `(name + sequence)` -> `sequence` -> `name`.
 - `--mmseqs-cache-mode {none,read,write,readwrite}` (default: `readwrite`)
 - `--mmseqs-store-fetched-msas <bool>` (forces cache writes)
 - `--mmseqs-pairing-strategy {greedy,query_only,copy_non_pairing}` (default: `greedy`)
-- `--mmseqs-db-tag <str>` (default: `colabfold_env`)
+- `--mmseqs-db-tag <str>` (default: `auto`)
+  - `auto` resolves to `colabfold_env` in `colabfold` mode and `uniref100_v1` in `local_gpu` mode.
+- `--mmseqs-fallback {none,colabfold}` (default: `none`)
+  - `local_gpu` mode is fail-fast by default; set `colabfold` only if you explicitly want fallback.
+
+### Local MMseqs controls (`--mmseqs-mode local_gpu`)
+
+- `--mmseqs-local-workers <int>` (default: `1`)
+- `--mmseqs-local-batch-size <int>` (default: `8`)
+- `--mmseqs-local-db-profile {uniref100_only,uniref100_plus_env}` (default: `uniref100_only`)
+  - `uniref100_plus_env` is reserved for a later phase; current implementation supports `uniref100_only`.
+  - Must match the initialized DB manifest profile.
+- `--mmseqs-local-gpu <type>` (default: `A10G`; available: `A10G`, `L40S`, `A100-40GB`, `A100-80GB`, `H100`)
+  - Recommended: Ampere or newer (`A100-80GB` or `H100`) for local MMseqs GPU search performance.
+- `--mmseqs-local-max-seqs <int>` (default: `300`)
+- `--mmseqs-local-prefilter-mode <int>` (default: `1`)
+- `--mmseqs-local-tmp-dir <path>` (default: `/tmp/mmseqs_work`)
+- `--mmseqs-local-tmp-min-free-gb <float>` (default: `5.0`)
+- `--mmseqs-local-commit-every-n <int>` (default: `1`)
+- `--mmseqs-local-commit-interval-s <float>` (default: `30.0`)
+
+Scratch-space behavior:
+
+- Local mode checks free space before each fetch batch and fails fast when insufficient.
+- If preferred tmp path is too full, workers can fall back to `/mmseqs_tmp`.
 
 ### Inference controls
 
@@ -156,6 +259,17 @@ Lookup priority is: `(name + sequence)` -> `sequence` -> `name`.
 - `--n-cycle <int>` (default: `10`)
 - `--best-sample-scope {global,per_seed}` (default: `global`)
 - `--task-timeout-s <int>` (default: `7200`)
+
+### Inference batching
+
+Protenix accepts an `input.json` containing multiple samples; the pipeline can bundle multiple
+ready tasks into a single Protenix invocation to amortize model load.
+
+- `--inference-max-batch-size <int>` (default: `1`)
+  - Upper bound only: inference workers start as soon as at least 1 task is ready.
+  - Increase this to reduce repeated checkpoint loads.
+- `--inference-batch-fill-window-s <float>` (default: `0`)
+  - Optional: wait up to this many seconds to fill the batch (default is no waiting).
 
 ### ipSAE controls
 
@@ -196,7 +310,8 @@ Lookup priority is: `(name + sequence)` -> `sequence` -> `name`.
 
 - `--msa-min-submit-interval-s <float>` (default: `1.0`)
 - `--msa-global-rate-key <str>` (default: `protenix_msa_global`)
-- `--msa-max-inflight <int>` (currently must be `1`)
+- `--msa-max-inflight <int>` (currently must be `1` in `colabfold` mode)
+  - In `local_gpu` mode, submit throttling is disabled and this knob is ignored (batching/concurrency are controlled by local worker flags).
 
 ### Long-run reliability
 
@@ -224,6 +339,47 @@ Inference workers do not auto-download these files.
 ```bash
 modal run modal_protenix_batch.py::init_protenix_runtime \
   --model-name protenix_base_default_v1.0.0
+```
+
+### Initialize local MMseqs UniRef100 DB
+
+```bash
+modal run modal_protenix_batch.py::init_mmseqs_uniref100_db \
+  --db-tag uniref100_v1 \
+  --db-profile uniref100_only
+```
+
+### Standalone UniRef100 volume bootstrap (detached-friendly)
+
+This is the preferred operator workflow for large first-time DB builds, explicit target volume naming, and live progress checks.
+
+```bash
+modal run --detach modal_build_uniref100_db.py \
+  --volume-name mmseqs-uniref100-db \
+  --tmp-volume-name mmseqs-tmp
+```
+
+Useful flags:
+
+- `--volume-name` (default: `mmseqs-uniref100-db`)
+- `--tmp-volume-name` (default: `mmseqs-tmp`)
+- `--force-rebuild`
+- `--no-detach` (foreground mode)
+
+How it relates to local MMseqs pipeline:
+
+- `run_pipeline --mmseqs-mode local_gpu` reads DB artifacts/manifest from the MMseqs DB volume.
+- Keep `--mmseqs-db-tag` aligned with the initialized DB in that target volume.
+- You can bootstrap an alternate volume (for example `mmseqs-uniref100-db-2`) in parallel, then cut over by config/redeploy.
+
+### Local MMseqs smoke benchmark
+
+```bash
+modal run modal_protenix_batch.py::smoke_local_mmseqs \
+  --pair-csv ./test_batch.csv \
+  --n-sequences 10 \
+  --mmseqs-db-tag uniref100_v1 \
+  --mmseqs-local-gpu A100-80GB
 ```
 
 ### List supported GPUs
@@ -287,6 +443,9 @@ modal run modal_protenix_batch.py::test_connection --gpu A100-80GB
 - MSA fetching is dependency-gated and non-blocking: inference starts as soon as any task becomes ready.
 - Streaming artifacts and logs are written incrementally during task execution.
 - `run_metadata.json` includes `run_status` as one of: `complete_success`, `complete_with_errors`, `incomplete`.
+  - Tasks marked `running_elsewhere` (resume auto-skip) count toward `incomplete`, not `failed`.
+- Local mode (`--mmseqs-mode local_gpu`) requires initialized MMseqs DB manifest on the MMseqs DB volume.
+- In local mode, `--mmseqs-db-tag` should match the tag used with either `init_mmseqs_uniref100_db` or `modal_build_uniref100_db.py`.
 - `fixed_msa` mode performs warn-only compatibility checks against binder sequences.
 - Best-structure selection is based on highest `iptm`.
 - `run_metadata.json` captures key run configuration and run-level status for reproducibility.
