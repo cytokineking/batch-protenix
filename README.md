@@ -60,6 +60,40 @@ Optional override env vars for image source refs:
 modal run modal_protenix_batch.py::run_pipeline --help
 ```
 
+## VHH Template Prep
+
+For VHH binder libraries, you can pre-analyze binders into reusable MSA template groups
+without running the full structure pipeline.
+
+Modal analyze-only workflow:
+
+```bash
+modal run modal_protenix_batch.py::prepare_vhh_binder_msas \
+  --pair-csv ./test_batch.csv \
+  --output-dir ./runs/vhh_grouping \
+  --analyze-only \
+  --framework-mode lengths_only
+```
+
+Local helper workflow:
+
+```bash
+python vhh_msa_templates.py \
+  --pair-csv ./test_batch.csv \
+  --output-dir ./runs/vhh_grouping_local \
+  --framework-mode lengths_only
+```
+
+Framework grouping modes:
+
+- `--framework-mode {exact,lengths_only}` for VHH template grouping
+- Default: `lengths_only`
+- `exact`: split templates by exact `FR1/FR2/FR3/FR4` sequences plus IMGT `CDR1/2/3` registers
+- `lengths_only`: split templates by `FR1/FR2/FR3/FR4` lengths plus IMGT `CDR1/2/3` registers
+
+Use `lengths_only` when you want framework variants with the same length/register architecture
+to share a single MSA template representative.
+
 ## Required Input CSV
 
 `--pair-csv` should contain one pair per row (header optional). The first 4 columns are used:

@@ -39,6 +39,18 @@ from urllib.parse import urlparse
 
 import modal
 
+from vhh_msa_templates import (
+    analyze_vhh_sequence,
+    build_assignment_rows,
+    build_template_groups,
+    chunked,
+    csv_fieldnames,
+    extract_unique_binders,
+    merge_binder_analyses,
+    normalize_framework_mode,
+    shard_round_robin,
+)
+
 
 # =============================================================================
 # APP + RESOURCES
@@ -128,8 +140,10 @@ MMSEQS2_GIT_REF = os.environ.get("MMSEQS2_GIT_REF", "01683a607f83878e95436632d73
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("git", "wget", "build-essential", "cmake")
+    .apt_install("git", "wget", "build-essential", "cmake", "hmmer")
     .pip_install(
+        "abnumber",
+        "anarcii",
         "torch>=2.4.0",
         "numpy>=1.24,<2.0",
         "pandas>=2.0",
@@ -170,6 +184,7 @@ image = (
         f"cd /root/MMseqs2 && git checkout {shlex.quote(MMSEQS2_GIT_REF)}",
     )
     .add_local_file("ipsae.py", "/root/ipsae.py", copy=True)
+    .add_local_file("vhh_msa_templates.py", "/root/vhh_msa_templates.py", copy=True)
 )
 
 
@@ -1420,6 +1435,100 @@ def _read_cache_entry(cache_dir: Path) -> Dict[str, Optional[str]]:
     }
 
 
+def _lookup_cached_msa_entry(
+    *,
+    sequence: str,
+    role: str,
+    host_url: str,
+    msa_mode: str,
+    pairing_strategy: str,
+    db_tag: str,
+    context_hash: str,
+    context_meta: Optional[Dict[str, Any]],
+    fallback_mode: str = "none",
+    require_complete_marker: bool = False,
+) -> Optional[Dict[str, Any]]:
+    mode_n = (msa_mode or "colabfold").strip().lower()
+    fallback_n = (fallback_mode or "none").strip().lower()
+    cache_context_meta = dict(context_meta or {})
+
+    cache_key = _build_cache_key(
+        sequence=sequence,
+        role=role,
+        host_url=host_url,
+        msa_mode=mode_n,
+        pairing_strategy=pairing_strategy,
+        db_tag=db_tag,
+        context_hash=context_hash,
+    )
+    cache_dir = MSA_CACHE_ROOT / cache_key
+    if _cache_entry_valid(
+        cache_dir,
+        require_complete_marker=require_complete_marker,
+        context_meta=cache_context_meta if cache_context_meta else None,
+        expected_msa_modes=[mode_n],
+    ):
+        return {
+            "status": "cached",
+            "cache_key": cache_key,
+            "cache_dir": str(cache_dir),
+            "require_complete_marker": bool(require_complete_marker),
+        }
+
+    if mode_n == "local_gpu" and fallback_n == "colabfold":
+        fallback_cache_key = _build_cache_key(
+            sequence=sequence,
+            role=role,
+            host_url=host_url,
+            msa_mode="colabfold_fallback",
+            pairing_strategy=pairing_strategy,
+            db_tag=db_tag,
+            context_hash=context_hash,
+        )
+        fallback_cache_dir = MSA_CACHE_ROOT / fallback_cache_key
+        if _cache_entry_valid(
+            fallback_cache_dir,
+            require_complete_marker=require_complete_marker,
+            context_meta=cache_context_meta if cache_context_meta else None,
+            expected_msa_modes=["colabfold_fallback"],
+        ):
+            return {
+                "status": "cached",
+                "cache_key": fallback_cache_key,
+                "cache_dir": str(fallback_cache_dir),
+                "require_complete_marker": bool(require_complete_marker),
+                "fallback": "colabfold",
+            }
+
+    legacy_cache_key = _build_cache_key(
+        sequence=sequence,
+        role=role,
+        host_url=host_url,
+        msa_mode=mode_n,
+        pairing_strategy=pairing_strategy,
+        db_tag=db_tag,
+        context_hash="",
+    )
+    legacy_dir = MSA_CACHE_ROOT / legacy_cache_key
+    if legacy_dir.exists() and _legacy_cache_entry_valid(
+        legacy_dir,
+        sequence=sequence,
+        role=role,
+        host_url=host_url,
+        msa_mode=mode_n,
+        pairing_strategy=pairing_strategy,
+        db_tag=db_tag,
+    ):
+        return {
+            "status": "cached",
+            "cache_key": legacy_cache_key,
+            "cache_dir": str(legacy_dir),
+            "require_complete_marker": False,
+            "legacy_cache_key": True,
+        }
+    return None
+
+
 def _fetch_msa_local_mmseqs(
     sequence: str,
     mmseqs_bin: str,
@@ -1563,6 +1672,8 @@ def _get_or_fetch_cached_msa(
     write_cache: bool,
     max_fetch_attempts: int,
     require_complete_marker: bool,
+    fallback_hosted_rate_key: str = "",
+    fallback_hosted_min_interval_s: float = 0.0,
 ) -> Dict[str, Any]:
     mode_n = (msa_mode or "colabfold").strip().lower()
     fallback_n = (fallback_mode or "none").strip().lower()
@@ -1743,6 +1854,11 @@ def _get_or_fetch_cached_msa(
                         "fallback": "colabfold",
                     }
                 try:
+                    if fallback_hosted_rate_key:
+                        _acquire_global_msa_submit_slot(
+                            fallback_hosted_rate_key,
+                            fallback_hosted_min_interval_s,
+                        )
                     fetched = _fetch_msa_colabfold(
                         sequence=sequence,
                         host_url=host_url,
@@ -1893,6 +2009,8 @@ def _precompute_msas_impl(
     local_tmp_dir: str = "/tmp/mmseqs_work",
     local_tmp_min_free_gb: float = 5.0,
     fallback_mode: str = "none",
+    fallback_hosted_rate_key: str = "",
+    fallback_hosted_min_interval_s: float = 0.0,
 ) -> Dict[str, Dict[str, Any]]:
     call_started = time.time()
     read_cache, write_cache = _cache_mode_flags(cache_mode, store_alias=store_fetched_msas)
@@ -1946,6 +2064,8 @@ def _precompute_msas_impl(
                 write_cache=write_cache,
                 max_fetch_attempts=max_fetch_attempts,
                 require_complete_marker=require_complete_marker,
+                fallback_hosted_rate_key=fallback_hosted_rate_key,
+                fallback_hosted_min_interval_s=fallback_hosted_min_interval_s,
             )
             results[seq] = info
             if str(info.get("status")) == "fetched_and_cached":
@@ -2009,6 +2129,8 @@ def precompute_msas(
     local_tmp_dir: str = "/tmp/mmseqs_work",
     local_tmp_min_free_gb: float = 5.0,
     fallback_mode: str = "none",
+    fallback_hosted_rate_key: str = "",
+    fallback_hosted_min_interval_s: float = 0.0,
 ) -> Dict[str, Dict[str, Any]]:
     return _precompute_msas_impl(
         sequences=sequences,
@@ -2032,6 +2154,8 @@ def precompute_msas(
         local_tmp_dir=local_tmp_dir,
         local_tmp_min_free_gb=local_tmp_min_free_gb,
         fallback_mode=fallback_mode,
+        fallback_hosted_rate_key=fallback_hosted_rate_key,
+        fallback_hosted_min_interval_s=fallback_hosted_min_interval_s,
     )
 
 
@@ -2127,6 +2251,188 @@ MSA_GPU_FUNCTIONS = {
     "L40S": precompute_msas_local_L40S,
     "H100": precompute_msas_local_H100,
 }
+
+
+@app.function(
+    image=image,
+    timeout=1800,
+)
+def analyze_vhh_sequences_remote(
+    sequences: List[str],
+    numbering_scheme: str = "imgt",
+) -> Dict[str, Dict[str, Any]]:
+    results: Dict[str, Dict[str, Any]] = {}
+    for seq in sorted({_normalize_sequence(s) for s in sequences if s}):
+        try:
+            results[seq] = {
+                "ok": True,
+                "analysis": analyze_vhh_sequence(seq, numbering_scheme=numbering_scheme),
+                "stage": "numbering",
+            }
+        except Exception as exc:  # noqa: BLE001
+            results[seq] = {
+                "ok": False,
+                "error": str(exc),
+                "stage": "numbering",
+            }
+    return results
+
+
+@app.function(
+    image=image,
+    timeout=1800,
+    volumes={str(MSA_CACHE_ROOT): msa_cache_volume},
+)
+def probe_cached_msa_entries_remote(
+    sequences: List[str],
+    role: str,
+    host_url: str,
+    msa_mode: str,
+    pairing_strategy: str,
+    db_tag: str,
+    context_hash: str,
+    context_metadata: Optional[Dict[str, Any]] = None,
+    fallback_mode: str = "none",
+    require_complete_marker: bool = False,
+) -> Dict[str, Dict[str, Any]]:
+    try:
+        msa_cache_volume.reload()
+    except Exception:  # noqa: BLE001
+        pass
+
+    mode_n = (msa_mode or "colabfold").strip().lower()
+    context_meta = dict(context_metadata or {})
+    out: Dict[str, Dict[str, Any]] = {}
+    for seq in sorted({_normalize_sequence(s) for s in sequences if s}):
+        info = _lookup_cached_msa_entry(
+            sequence=seq,
+            role=role,
+            host_url=host_url,
+            msa_mode=mode_n,
+            pairing_strategy=pairing_strategy,
+            db_tag=db_tag,
+            context_hash=context_hash,
+            context_meta=context_meta if context_meta else None,
+            fallback_mode=fallback_mode,
+            require_complete_marker=require_complete_marker,
+        )
+        if info is None:
+            out[seq] = {"status": "missing"}
+            continue
+        result = dict(info)
+        result["effective_msa_mode"] = _effective_msa_mode_from_fetch_info(mode_n, result)
+        out[seq] = result
+    return out
+
+
+@app.function(
+    image=image,
+    timeout=7200,
+    volumes={str(MSA_CACHE_ROOT): msa_cache_volume},
+)
+def materialize_vhh_member_cache_entries_remote(
+    entries: List[Dict[str, Any]],
+    commit_every_n: int = 64,
+) -> List[Dict[str, Any]]:
+    try:
+        msa_cache_volume.reload()
+    except Exception:  # noqa: BLE001
+        pass
+
+    pending_commit = 0
+    out: List[Dict[str, Any]] = []
+    for entry in entries:
+        seq = _normalize_sequence(str(entry.get("member_sequence", "") or ""))
+        cache_key = str(entry.get("cache_key", "") or "")
+        effective_mode = str(entry.get("effective_msa_mode", "") or "")
+        context_meta = dict(entry.get("context_metadata") or {})
+        require_complete_marker = bool(entry.get("require_complete_marker", False))
+        result = {
+            "template_id": str(entry.get("template_id", "")),
+            "binder_sequence_sha256": hashlib.sha256(seq.encode("utf-8")).hexdigest() if seq else "",
+            "cache_key": cache_key,
+            "effective_msa_mode": effective_mode,
+        }
+        try:
+            if not seq or not cache_key or not effective_mode:
+                raise ValueError("Missing member sequence, cache key, or effective_msa_mode")
+
+            cache_dir = MSA_CACHE_ROOT / cache_key
+            if _cache_entry_valid(
+                cache_dir,
+                require_complete_marker=require_complete_marker,
+                context_meta=context_meta if context_meta else None,
+                expected_msa_modes=[effective_mode],
+            ):
+                result["status"] = "cached"
+                out.append(result)
+                continue
+
+            rep_cache_key = str(entry.get("representative_cache_key", "") or "")
+            rep_effective_mode = str(entry.get("representative_effective_msa_mode", "") or effective_mode)
+            rep_require_complete = bool(
+                entry.get("representative_require_complete_marker", require_complete_marker)
+            )
+            if not rep_cache_key:
+                raise ValueError("Missing representative cache key")
+            rep_cache_dir = MSA_CACHE_ROOT / rep_cache_key
+            if not _cache_entry_valid(
+                rep_cache_dir,
+                require_complete_marker=rep_require_complete,
+                expected_msa_modes=[rep_effective_mode],
+            ):
+                try:
+                    msa_cache_volume.reload()
+                except Exception:  # noqa: BLE001
+                    pass
+                if not _cache_entry_valid(
+                    rep_cache_dir,
+                    require_complete_marker=rep_require_complete,
+                    expected_msa_modes=[rep_effective_mode],
+                ):
+                    raise RuntimeError(f"Representative cache entry missing or invalid: {rep_cache_key}")
+
+            rep_entry = _read_cache_entry(rep_cache_dir)
+            rep_non_pairing = str(rep_entry.get("non_pairing") or "")
+            if not rep_non_pairing:
+                raise RuntimeError("Representative cache entry missing non_pairing.a3m")
+
+            non_pairing = _normalize_a3m_non_pairing(rep_non_pairing, query_seq=seq)
+            pairing = _pairing_from_strategy(
+                non_pairing,
+                query_seq=seq,
+                pairing_strategy=str(entry.get("pairing_strategy", "greedy") or "greedy"),
+            )
+
+            metadata = dict(entry.get("metadata") or {})
+            _write_cache_entry(
+                cache_dir=cache_dir,
+                pairing=pairing,
+                non_pairing=non_pairing,
+                metadata=metadata,
+            )
+            pending_commit += 1
+            if pending_commit >= max(1, int(commit_every_n)):
+                msa_cache_volume.commit()
+                pending_commit = 0
+
+            if not _cache_entry_valid(
+                cache_dir,
+                require_complete_marker=require_complete_marker,
+                context_meta=context_meta if context_meta else None,
+                expected_msa_modes=[effective_mode],
+            ):
+                raise RuntimeError(f"Derived cache entry validation failed: {cache_key}")
+
+            result["status"] = "materialized"
+        except Exception as exc:  # noqa: BLE001
+            result["status"] = "error"
+            result["error"] = str(exc)
+        out.append(result)
+
+    if pending_commit > 0:
+        msa_cache_volume.commit()
+    return out
 
 
 @app.function(
@@ -4178,6 +4484,190 @@ def _write_summary_csv(output_root: Path, results: Sequence[Dict[str, Any]]) -> 
     return csv_path
 
 
+def _write_dict_rows_csv(
+    path: Path,
+    rows: Sequence[Dict[str, Any]],
+    fieldnames: Optional[Sequence[str]] = None,
+) -> Path:
+    header = csv_fieldnames(rows, preferred=fieldnames)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row.get(name, "") for name in header})
+    return path
+
+
+def _effective_msa_mode_from_fetch_info(requested_mode: str, info: Dict[str, Any]) -> str:
+    mode = str(requested_mode or "").strip().lower()
+    if mode == "local_gpu" and str(info.get("fallback", "")) == "colabfold":
+        return "colabfold_fallback"
+    return mode
+
+
+def _resolve_prepare_msa_context(
+    *,
+    mmseqs_mode: str,
+    mmseqs_host_url: Optional[str],
+    mmseqs_host_policy: str,
+    mmseqs_db_tag: str,
+    mmseqs_pairing_strategy: str,
+    mmseqs_local_db_profile: str,
+    mmseqs_local_gpu: str,
+    mmseqs_local_max_seqs: int,
+    mmseqs_local_prefilter_mode: int,
+    mmseqs_fallback: str,
+    msa_min_submit_interval_s: float,
+    msa_global_rate_key: str,
+) -> Dict[str, Any]:
+    mmseqs_mode_n = str(mmseqs_mode).strip().lower()
+    if mmseqs_mode_n not in {"colabfold", "local_gpu"}:
+        raise ValueError("--mmseqs-mode must be one of: colabfold,local_gpu")
+    mmseqs_fallback_n = str(mmseqs_fallback or "none").strip().lower()
+    if mmseqs_fallback_n not in {"none", "colabfold"}:
+        raise ValueError("--mmseqs-fallback must be one of: none,colabfold")
+    db_profile_n = str(mmseqs_local_db_profile or "uniref100_only").strip().lower()
+    if db_profile_n != "uniref100_only":
+        raise ValueError("--mmseqs-local-db-profile must be uniref100_only for prepare_vhh_binder_msas")
+
+    raw_db_tag = str(mmseqs_db_tag or "").strip()
+    if not raw_db_tag or raw_db_tag.lower() == "auto":
+        resolved_db_tag = "uniref100_v1" if mmseqs_mode_n == "local_gpu" else "colabfold_env"
+    else:
+        resolved_db_tag = raw_db_tag
+
+    host_url = ""
+    manifest: Optional[Dict[str, Any]] = None
+    manifest_sha = ""
+    mmseqs_version = ""
+    build_fingerprint = ""
+    msa_precompute_fn = precompute_msas
+    if mmseqs_mode_n == "colabfold":
+        host_url = _resolve_mmseqs_host(mmseqs_host_url, mmseqs_host_policy)
+    else:
+        if mmseqs_fallback_n == "colabfold" or (mmseqs_host_url and str(mmseqs_host_url).strip()):
+            host_url = _resolve_mmseqs_host(mmseqs_host_url, mmseqs_host_policy)
+        if mmseqs_local_gpu not in MSA_GPU_FUNCTIONS:
+            raise ValueError(
+                f"Unknown --mmseqs-local-gpu '{mmseqs_local_gpu}'. Available: {sorted(MSA_GPU_FUNCTIONS.keys())}"
+            )
+        manifest = get_mmseqs_db_manifest.remote(
+            expected_db_tag=resolved_db_tag,
+            expected_db_profile=db_profile_n,
+        )
+        manifest_sha = str(manifest.get("manifest_sha256") or "")
+        mmseqs_version = str(manifest.get("mmseqs_version") or "")
+        build_fingerprint = str(manifest.get("build_fingerprint") or "")
+        msa_precompute_fn = MSA_GPU_FUNCTIONS[mmseqs_local_gpu]
+
+    context_hash = _msa_context_hash(
+        mmseqs_mode=mmseqs_mode_n,
+        mmseqs_host_url=host_url,
+        mmseqs_db_tag=resolved_db_tag,
+        mmseqs_pairing_strategy=mmseqs_pairing_strategy,
+        mmseqs_db_profile=db_profile_n if mmseqs_mode_n == "local_gpu" else "",
+        mmseqs_manifest_sha256=manifest_sha,
+        mmseqs_version=mmseqs_version,
+        mmseqs_build_fingerprint=build_fingerprint,
+        mmseqs_local_max_seqs=mmseqs_local_max_seqs if mmseqs_mode_n == "local_gpu" else None,
+        mmseqs_local_prefilter_mode=(
+            mmseqs_local_prefilter_mode if mmseqs_mode_n == "local_gpu" else None
+        ),
+    )
+    context_metadata = {
+        "mmseqs_mode": mmseqs_mode_n,
+        "mmseqs_db_tag": resolved_db_tag,
+        "mmseqs_pairing_strategy": mmseqs_pairing_strategy,
+        "mmseqs_context_hash": context_hash,
+    }
+    if mmseqs_mode_n == "local_gpu":
+        context_metadata.update(
+            {
+                "mmseqs_db_profile": db_profile_n,
+                "mmseqs_manifest_sha256": manifest_sha,
+                "mmseqs_version": mmseqs_version,
+                "mmseqs_build_fingerprint": build_fingerprint,
+                "mmseqs_local_max_seqs": int(mmseqs_local_max_seqs),
+                "mmseqs_local_prefilter_mode": int(mmseqs_local_prefilter_mode),
+            }
+        )
+
+    return {
+        "mmseqs_mode_n": mmseqs_mode_n,
+        "mmseqs_fallback_n": mmseqs_fallback_n,
+        "resolved_db_tag": resolved_db_tag,
+        "host_url": host_url,
+        "mmseqs_manifest": manifest,
+        "mmseqs_manifest_sha": manifest_sha,
+        "mmseqs_version": mmseqs_version,
+        "mmseqs_build_fingerprint": build_fingerprint,
+        "msa_precompute_fn": msa_precompute_fn,
+        "context_hash": context_hash,
+        "context_metadata": context_metadata,
+        "msa_min_submit_interval_s": float(max(0.0, msa_min_submit_interval_s)),
+        "msa_global_rate_key": str(msa_global_rate_key or "protenix_msa_global"),
+    }
+
+
+def _render_prepare_recommended_run_flags(
+    *,
+    pair_csv: str,
+    output_dir: str,
+    mmseqs_mode_n: str,
+    host_url: str,
+    mmseqs_host_policy: str,
+    resolved_db_tag: str,
+    mmseqs_pairing_strategy: str,
+    mmseqs_local_db_profile: str,
+    mmseqs_local_gpu: str,
+    mmseqs_fallback_n: str,
+    mmseqs_local_workers: int,
+    mmseqs_local_batch_size: int,
+    mmseqs_local_max_seqs: int,
+    mmseqs_local_prefilter_mode: int,
+    msa_min_submit_interval_s: float,
+    msa_global_rate_key: str,
+) -> str:
+    pair_csv_q = shlex.quote(pair_csv)
+    output_dir_q = shlex.quote(output_dir)
+    lines = [
+        "modal run modal_protenix_batch.py::run_pipeline \\",
+        f"  --pair-csv {pair_csv_q} \\",
+        f"  --output-dir {output_dir_q} \\",
+        "  --binder-mode full_msa \\",
+        "  --target-msa-source mmseqs \\",
+        f"  --mmseqs-mode {mmseqs_mode_n} \\",
+        f"  --mmseqs-pairing-strategy {mmseqs_pairing_strategy} \\",
+        f"  --mmseqs-db-tag {resolved_db_tag} \\",
+    ]
+    if host_url:
+        lines.append(f"  --mmseqs-host-url {shlex.quote(host_url)} \\")
+        lines.append(f"  --mmseqs-host-policy {mmseqs_host_policy} \\")
+    if mmseqs_mode_n == "local_gpu":
+        lines.extend(
+            [
+                f"  --mmseqs-local-workers {int(mmseqs_local_workers)} \\",
+                f"  --mmseqs-local-batch-size {int(mmseqs_local_batch_size)} \\",
+                f"  --mmseqs-local-db-profile {mmseqs_local_db_profile} \\",
+                f"  --mmseqs-local-gpu {mmseqs_local_gpu} \\",
+                f"  --mmseqs-local-max-seqs {int(mmseqs_local_max_seqs)} \\",
+                f"  --mmseqs-local-prefilter-mode {int(mmseqs_local_prefilter_mode)} \\",
+                f"  --mmseqs-fallback {mmseqs_fallback_n} \\",
+            ]
+        )
+    if mmseqs_mode_n == "colabfold" or mmseqs_fallback_n == "colabfold":
+        lines.extend(
+            [
+                f"  --msa-min-submit-interval-s {float(msa_min_submit_interval_s):.3f} \\",
+                f"  --msa-global-rate-key {msa_global_rate_key} \\",
+            ]
+        )
+    if lines[-1].endswith(" \\"):
+        lines[-1] = lines[-1][:-2]
+    return "\n".join(lines) + "\n"
+
+
 def _redact_event(event: Dict[str, Any], artifact_paths: List[str], stale_epoch: bool) -> Dict[str, Any]:
     redacted = dict(event)
     for heavy in ("cif_text", "summary_confidence_json", "full_data_json", "text", "data"):
@@ -5321,6 +5811,10 @@ def run_pipeline(
             local_tmp_dir=mmseqs_local_tmp_dir,
             local_tmp_min_free_gb=mmseqs_local_tmp_min_free_gb,
             fallback_mode=mmseqs_fallback_n,
+            fallback_hosted_rate_key=msa_global_rate_key if mmseqs_fallback_n == "colabfold" else "",
+            fallback_hosted_min_interval_s=(
+                msa_min_submit_interval_s if mmseqs_fallback_n == "colabfold" else 0.0
+            ),
         )
 
     def resolver_loop() -> None:
@@ -6074,6 +6568,587 @@ def smoke_local_mmseqs(
     print(f"Success: {ok}/{len(seqs)}")
     print(f"Cache hit %: {(100.0 * cached / max(1,len(seqs))):.1f}%")
     print(f"Seq/s: {(len(seqs) / max(0.001, elapsed)):.2f}")
+
+
+@app.local_entrypoint()
+def prepare_vhh_binder_msas(
+    pair_csv: str,
+    output_dir: str = "./binder_msa_prep",
+    numbering_scheme: str = "imgt",
+    strict_numbering: bool = True,
+    analyze_only: bool = False,
+    framework_mode: str = "lengths_only",
+    representative_policy: str = "first",
+    mmseqs_mode: str = "colabfold",
+    mmseqs_host_url: Optional[str] = None,
+    mmseqs_host_policy: str = "strict",
+    mmseqs_db_tag: str = "auto",
+    mmseqs_pairing_strategy: str = "greedy",
+    mmseqs_local_db_profile: str = "uniref100_only",
+    mmseqs_local_gpu: str = "A10G",
+    mmseqs_local_workers: int = 1,
+    mmseqs_local_batch_size: int = 8,
+    mmseqs_fallback: str = "none",
+    mmseqs_local_max_seqs: int = 300,
+    mmseqs_local_prefilter_mode: int = 1,
+    mmseqs_local_tmp_dir: str = "/tmp/mmseqs_work",
+    mmseqs_local_tmp_min_free_gb: float = 5.0,
+    mmseqs_local_commit_every_n: int = 1,
+    mmseqs_local_commit_interval_s: float = 30.0,
+    msa_min_submit_interval_s: float = 1.0,
+    msa_global_rate_key: str = "protenix_msa_global",
+    max_templates: int = 0,
+    max_members_per_template: int = 0,
+    write_member_cache_entries: bool = True,
+    emit_recommended_run_flags: bool = True,
+):
+    numbering_scheme_n = str(numbering_scheme or "imgt").strip().lower()
+    representative_policy_n = str(representative_policy or "first").strip().lower()
+    framework_mode_n = normalize_framework_mode(framework_mode)
+    strict_numbering = _coerce_bool(strict_numbering)
+    analyze_only = _coerce_bool(analyze_only)
+    write_member_cache_entries = _coerce_bool(write_member_cache_entries)
+    emit_recommended_run_flags = _coerce_bool(emit_recommended_run_flags)
+    mmseqs_local_workers = max(1, int(mmseqs_local_workers))
+    mmseqs_local_batch_size = max(1, int(mmseqs_local_batch_size))
+    mmseqs_local_max_seqs = max(1, int(mmseqs_local_max_seqs))
+    mmseqs_local_prefilter_mode = int(mmseqs_local_prefilter_mode)
+    mmseqs_local_tmp_min_free_gb = max(0.0, float(mmseqs_local_tmp_min_free_gb))
+    mmseqs_local_commit_every_n = max(1, int(mmseqs_local_commit_every_n))
+    mmseqs_local_commit_interval_s = max(0.0, float(mmseqs_local_commit_interval_s))
+    msa_min_submit_interval_s = max(0.0, float(msa_min_submit_interval_s))
+    max_templates = max(0, int(max_templates))
+    max_members_per_template = max(0, int(max_members_per_template))
+    if numbering_scheme_n != "imgt":
+        raise ValueError("--numbering-scheme must be 'imgt' in MVP")
+    if representative_policy_n != "first":
+        raise ValueError("--representative-policy must be 'first' in MVP")
+
+    pair_rows = _load_pair_rows(Path(pair_csv))
+    if not pair_rows:
+        raise ValueError(f"No valid rows found in {pair_csv}")
+
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    unique_binders = extract_unique_binders(pair_rows)
+    if not unique_binders:
+        raise ValueError(f"No valid binder rows found in {pair_csv}")
+
+    unique_sequences = [str(rec["binder_sequence"]) for rec in unique_binders]
+    analyses_by_sequence: Dict[str, Dict[str, Any]] = {}
+    analysis_batches = chunked(unique_sequences, 256)
+    for idx, batch in enumerate(analysis_batches, start=1):
+        _log(f"[VHH] analyzing batch {idx}/{len(analysis_batches)} n={len(batch)}")
+        analyses_by_sequence.update(
+            analyze_vhh_sequences_remote.remote(batch, numbering_scheme=numbering_scheme_n)
+        )
+
+    merged = merge_binder_analyses(unique_binders, analyses_by_sequence)
+    accepted = list(merged.get("analyzed") or [])
+    rejected = list(merged.get("rejected") or [])
+    groups = build_template_groups(
+        accepted,
+        representative_policy=representative_policy_n,
+        max_templates=max_templates,
+        max_members_per_template=max_members_per_template,
+        framework_mode=framework_mode_n,
+    )
+    assignment_rows = build_assignment_rows(groups)
+    execution_skip_reason = ""
+    if analyze_only:
+        execution_skip_reason = "analyze_only"
+    elif strict_numbering and rejected:
+        execution_skip_reason = "strict_numbering_rejected"
+    elif not accepted:
+        execution_skip_reason = "no_accepted_binders"
+
+    context: Optional[Dict[str, Any]] = None
+    recommended_flags = ""
+    if not execution_skip_reason:
+        context = _resolve_prepare_msa_context(
+            mmseqs_mode=mmseqs_mode,
+            mmseqs_host_url=mmseqs_host_url,
+            mmseqs_host_policy=mmseqs_host_policy,
+            mmseqs_db_tag=mmseqs_db_tag,
+            mmseqs_pairing_strategy=mmseqs_pairing_strategy,
+            mmseqs_local_db_profile=mmseqs_local_db_profile,
+            mmseqs_local_gpu=mmseqs_local_gpu,
+            mmseqs_local_max_seqs=mmseqs_local_max_seqs,
+            mmseqs_local_prefilter_mode=mmseqs_local_prefilter_mode,
+            mmseqs_fallback=mmseqs_fallback,
+            msa_min_submit_interval_s=msa_min_submit_interval_s,
+            msa_global_rate_key=msa_global_rate_key,
+        )
+        recommended_flags = _render_prepare_recommended_run_flags(
+            pair_csv=pair_csv,
+            output_dir=str((output_root / "run_pipeline_results").resolve()),
+            mmseqs_mode_n=context["mmseqs_mode_n"],
+            host_url=context["host_url"],
+            mmseqs_host_policy=mmseqs_host_policy,
+            resolved_db_tag=context["resolved_db_tag"],
+            mmseqs_pairing_strategy=mmseqs_pairing_strategy,
+            mmseqs_local_db_profile=mmseqs_local_db_profile,
+            mmseqs_local_gpu=mmseqs_local_gpu,
+            mmseqs_fallback_n=context["mmseqs_fallback_n"],
+            mmseqs_local_workers=mmseqs_local_workers,
+            mmseqs_local_batch_size=mmseqs_local_batch_size,
+            mmseqs_local_max_seqs=mmseqs_local_max_seqs,
+            mmseqs_local_prefilter_mode=mmseqs_local_prefilter_mode,
+            msa_min_submit_interval_s=context["msa_min_submit_interval_s"],
+            msa_global_rate_key=context["msa_global_rate_key"],
+        )
+    elif emit_recommended_run_flags:
+        recommended_flags = (
+            f"MSA context resolution skipped during prepare_vhh_binder_msas: {execution_skip_reason}\n"
+        )
+
+    def _representative_precompute_kwargs(sequences: List[str]) -> Dict[str, Any]:
+        if context is None:
+            raise RuntimeError("MSA context was not resolved before representative precompute")
+        return {
+            "sequences": sequences,
+            "role": "binder",
+            "host_url": context["host_url"],
+            "cache_mode": "readwrite",
+            "store_fetched_msas": False,
+            "msa_mode": context["mmseqs_mode_n"],
+            "pairing_strategy": mmseqs_pairing_strategy,
+            "db_tag": context["resolved_db_tag"],
+            "context_hash": context["context_hash"],
+            "context_metadata": context["context_metadata"],
+            "local_db_manifest": context["mmseqs_manifest"],
+            "local_batch_size": max(1, min(mmseqs_local_batch_size, len(sequences))),
+            "local_commit_every_n": mmseqs_local_commit_every_n,
+            "local_commit_interval_s": mmseqs_local_commit_interval_s,
+            "local_max_seqs": mmseqs_local_max_seqs,
+            "local_prefilter_mode": mmseqs_local_prefilter_mode,
+            "local_use_gpu": context["mmseqs_mode_n"] == "local_gpu",
+            "local_tmp_dir": mmseqs_local_tmp_dir,
+            "local_tmp_min_free_gb": mmseqs_local_tmp_min_free_gb,
+            "fallback_mode": context["mmseqs_fallback_n"],
+            "fallback_hosted_rate_key": (
+                context["msa_global_rate_key"] if context["mmseqs_fallback_n"] == "colabfold" else ""
+            ),
+            "fallback_hosted_min_interval_s": (
+                context["msa_min_submit_interval_s"] if context["mmseqs_fallback_n"] == "colabfold" else 0.0
+            ),
+        }
+
+    def _representative_row(
+        *,
+        template_id: str,
+        binder_sequence: str,
+        info: Dict[str, Any],
+        elapsed_s: float,
+    ) -> Dict[str, Any]:
+        effective_mode = str(
+            info.get("effective_msa_mode")
+            or _effective_msa_mode_from_fetch_info((context or {}).get("mmseqs_mode_n", ""), info)
+        )
+        return {
+            "record_type": "representative_fetch",
+            "template_id": template_id,
+            "binder_sequence_sha256": hashlib.sha256(binder_sequence.encode("utf-8")).hexdigest(),
+            "cache_key": str(info.get("cache_key", "")),
+            "status": str(info.get("status", "error")),
+            "elapsed_s": round(float(elapsed_s), 4),
+            "error": str(info.get("error", "")),
+            "effective_msa_mode": effective_mode,
+        }
+
+    rep_fetch_rows: List[Dict[str, Any]] = []
+    rep_state: Dict[str, Dict[str, Any]] = {}
+    member_rows: List[Dict[str, Any]] = []
+    member_written_counts: Dict[str, int] = {str(group["template_id"]): 0 for group in groups}
+    errors: List[str] = []
+
+    if context is not None and groups:
+        representative_sequences = [str(group["representative_sequence"]) for group in groups]
+        if context["mmseqs_mode_n"] == "colabfold":
+            cached_representatives = probe_cached_msa_entries_remote.remote(
+                representative_sequences,
+                role="binder",
+                host_url=context["host_url"],
+                msa_mode=context["mmseqs_mode_n"],
+                pairing_strategy=mmseqs_pairing_strategy,
+                db_tag=context["resolved_db_tag"],
+                context_hash=context["context_hash"],
+                context_metadata=context["context_metadata"],
+                fallback_mode="none",
+                require_complete_marker=False,
+            )
+            for group in groups:
+                template_id = str(group["template_id"])
+                seq = str(group["representative_sequence"])
+                started = time.time()
+                info = dict(cached_representatives.get(seq) or {"status": "missing"})
+                if str(info.get("status")) != "cached":
+                    _acquire_global_msa_submit_slot(
+                        context["msa_global_rate_key"],
+                        context["msa_min_submit_interval_s"],
+                    )
+                    fetched_map = context["msa_precompute_fn"].remote(
+                        **_representative_precompute_kwargs([seq])
+                    )
+                    info = dict(fetched_map.get(seq) or {"status": "error", "error": "missing result"})
+                effective_mode = str(
+                    info.get("effective_msa_mode")
+                    or _effective_msa_mode_from_fetch_info(context["mmseqs_mode_n"], info)
+                )
+                rep_state[template_id] = {
+                    "info": info,
+                    "effective_msa_mode": effective_mode,
+                }
+                rep_fetch_rows.append(
+                    _representative_row(
+                        template_id=template_id,
+                        binder_sequence=seq,
+                        info=info,
+                        elapsed_s=time.time() - started,
+                    )
+                )
+                if str(info.get("status")) not in {"cached", "fetched_and_cached"}:
+                    errors.append(
+                        f"Representative fetch failed for {template_id}: {info.get('error', 'unknown error')}"
+                    )
+        else:
+            shards = shard_round_robin(groups, min(mmseqs_local_workers, max(1, len(groups))))
+
+            def _run_local_shard(
+                shard_groups: List[Dict[str, Any]],
+            ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], float]:
+                seqs = [str(group["representative_sequence"]) for group in shard_groups]
+                started = time.time()
+                info_map = context["msa_precompute_fn"].remote(**_representative_precompute_kwargs(seqs))
+                return shard_groups, info_map, time.time() - started
+
+            with ThreadPoolExecutor(max_workers=max(1, len(shards))) as pool:
+                futures = [pool.submit(_run_local_shard, shard) for shard in shards]
+                for future in futures:
+                    shard_groups, info_map, shard_elapsed = future.result()
+                    for group in shard_groups:
+                        template_id = str(group["template_id"])
+                        seq = str(group["representative_sequence"])
+                        info = dict(info_map.get(seq) or {"status": "error", "error": "missing result"})
+                        effective_mode = str(
+                            info.get("effective_msa_mode")
+                            or _effective_msa_mode_from_fetch_info(context["mmseqs_mode_n"], info)
+                        )
+                        rep_state[template_id] = {
+                            "info": info,
+                            "effective_msa_mode": effective_mode,
+                        }
+                        rep_fetch_rows.append(
+                            _representative_row(
+                                template_id=template_id,
+                                binder_sequence=seq,
+                                info=info,
+                                elapsed_s=shard_elapsed,
+                            )
+                        )
+                        if str(info.get("status")) not in {"cached", "fetched_and_cached"}:
+                            errors.append(
+                                f"Representative fetch failed for {template_id}: {info.get('error', 'unknown error')}"
+                            )
+
+    if context is not None and write_member_cache_entries and groups and not errors:
+        materialization_entries: List[Dict[str, Any]] = []
+        for group in groups:
+            template_id = str(group["template_id"])
+            state = rep_state.get(template_id) or {}
+            info = dict(state.get("info") or {})
+            if str(info.get("status")) not in {"cached", "fetched_and_cached"}:
+                continue
+            effective_mode = str(state.get("effective_msa_mode") or context["mmseqs_mode_n"])
+            representative_cache_key = str(info.get("cache_key", ""))
+            representative_require_complete = bool(
+                info.get(
+                    "require_complete_marker",
+                    context["mmseqs_mode_n"] == "local_gpu" or effective_mode == "colabfold_fallback",
+                )
+            )
+            representative_seq = str(group["representative_sequence"])
+            representative_seq_sha = hashlib.sha256(representative_seq.encode("utf-8")).hexdigest()
+            for member in group.get("members_for_materialization", []):
+                member_seq = str(member["binder_sequence"])
+                if member_seq == representative_seq:
+                    continue
+                member_cache_key = _build_cache_key(
+                    sequence=member_seq,
+                    role="binder",
+                    host_url=context["host_url"],
+                    msa_mode=effective_mode,
+                    pairing_strategy=mmseqs_pairing_strategy,
+                    db_tag=context["resolved_db_tag"],
+                    context_hash=context["context_hash"],
+                )
+                metadata = {
+                    "sequence_sha256": hashlib.sha256(member_seq.encode("utf-8")).hexdigest(),
+                    "role": "binder",
+                    "host_url": context["host_url"],
+                    "msa_mode": effective_mode,
+                    "pairing_strategy": mmseqs_pairing_strategy,
+                    "db_tag": context["resolved_db_tag"],
+                    "context_hash": context["context_hash"],
+                    "fetched_at": datetime.datetime.utcnow().isoformat() + "Z",
+                    "derived_from_template": True,
+                    "template_id": template_id,
+                    "representative_sequence_sha256": representative_seq_sha,
+                    "member_sequence_sha256": hashlib.sha256(member_seq.encode("utf-8")).hexdigest(),
+                    "numbering_scheme": str(group["numbering_scheme"]),
+                    "template_grouping_mode": str(group.get("template_grouping_mode", "")),
+                    "cdr1_register": str(group["cdr1_register"]),
+                    "cdr2_register": str(group["cdr2_register"]),
+                    "cdr3_register": str(group["cdr3_register"]),
+                    "fr1_length": int(group["fr1_length"]),
+                    "fr2_length": int(group["fr2_length"]),
+                    "fr3_length": int(group["fr3_length"]),
+                    "fr4_length": int(group["fr4_length"]),
+                    "cdr1_length": int(group["cdr1_length"]),
+                    "cdr2_length": int(group["cdr2_length"]),
+                    "cdr3_length": int(group["cdr3_length"]),
+                    "framework_hash": str(group["framework_hash"]),
+                    "derivation_mode": "query_swap",
+                }
+                if effective_mode == "colabfold_fallback":
+                    metadata["fallback_from"] = "local_gpu"
+                metadata.update(dict(context["context_metadata"]))
+                materialization_entries.append(
+                    {
+                        "template_id": template_id,
+                        "member_sequence": member_seq,
+                        "cache_key": member_cache_key,
+                        "effective_msa_mode": effective_mode,
+                        "require_complete_marker": bool(
+                            context["mmseqs_mode_n"] == "local_gpu"
+                            or effective_mode == "colabfold_fallback"
+                        ),
+                        "pairing_strategy": mmseqs_pairing_strategy,
+                        "context_metadata": context["context_metadata"],
+                        "representative_cache_key": representative_cache_key,
+                        "representative_effective_msa_mode": effective_mode,
+                        "representative_require_complete_marker": representative_require_complete,
+                        "metadata": metadata,
+                    }
+                )
+
+        for batch in chunked(materialization_entries, 128):
+            batch_results = materialize_vhh_member_cache_entries_remote.remote(
+                batch,
+                commit_every_n=mmseqs_local_commit_every_n,
+            )
+            for result in batch_results:
+                template_id = str(result.get("template_id", ""))
+                status = str(result.get("status", "error"))
+                if status in {"cached", "materialized"}:
+                    member_written_counts[template_id] = member_written_counts.get(template_id, 0) + 1
+                else:
+                    errors.append(
+                        f"Member cache materialization failed for {template_id}: "
+                        f"{result.get('error', 'unknown error')}"
+                    )
+                member_rows.append(
+                    {
+                        "record_type": "member_materialization",
+                        "template_id": template_id,
+                        "binder_sequence_sha256": str(result.get("binder_sequence_sha256", "")),
+                        "cache_key": str(result.get("cache_key", "")),
+                        "status": status,
+                        "elapsed_s": "",
+                        "error": str(result.get("error", "")),
+                        "effective_msa_mode": str(result.get("effective_msa_mode", "")),
+                    }
+                )
+
+    template_summary_rows: List[Dict[str, Any]] = []
+    for group in groups:
+        template_id = str(group["template_id"])
+        rep_info = dict((rep_state.get(template_id) or {}).get("info") or {})
+        group_errors = [msg for msg in errors if template_id in msg]
+        if execution_skip_reason == "analyze_only":
+            status = "analyzed_only"
+        elif execution_skip_reason == "strict_numbering_rejected":
+            status = "blocked_by_rejections"
+        elif execution_skip_reason == "no_accepted_binders":
+            status = "analysis_empty"
+        elif group_errors:
+            status = "error"
+        elif write_member_cache_entries:
+            status = "ready"
+        else:
+            status = "representative_ready"
+        template_summary_rows.append(
+            {
+                "template_id": template_id,
+                "representative_name": str(group["representative_name"]),
+                "representative_sequence": str(group["representative_sequence"]),
+                "group_size": int(group["group_size"]),
+                "template_grouping_mode": str(group.get("template_grouping_mode", "")),
+                "fr1_length": int(group["fr1_length"]),
+                "fr2_length": int(group["fr2_length"]),
+                "fr3_length": int(group["fr3_length"]),
+                "fr4_length": int(group["fr4_length"]),
+                "cdr1_length": int(group["cdr1_length"]),
+                "cdr2_length": int(group["cdr2_length"]),
+                "cdr3_length": int(group["cdr3_length"]),
+                "representative_cache_key": str(rep_info.get("cache_key", "")),
+                "member_cache_entries_written": int(member_written_counts.get(template_id, 0)),
+                "status": status,
+            }
+        )
+
+    precompute_rows = rep_fetch_rows + member_rows
+    manifest = {
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "input_csv_path": str(Path(pair_csv).resolve()),
+        "numbering_scheme": numbering_scheme_n,
+        "strict_numbering": bool(strict_numbering),
+        "analyze_only": bool(analyze_only),
+        "framework_mode": framework_mode_n,
+        "execution_skip_reason": execution_skip_reason,
+        "representative_selection_policy": representative_policy_n,
+        "msa_context": {
+            "mmseqs_mode": (context or {}).get("mmseqs_mode_n", ""),
+            "mmseqs_host_url": (context or {}).get("host_url", ""),
+            "mmseqs_host_policy": mmseqs_host_policy,
+            "mmseqs_db_tag": (context or {}).get("resolved_db_tag", ""),
+            "mmseqs_pairing_strategy": mmseqs_pairing_strategy,
+            "mmseqs_local_db_profile": (
+                mmseqs_local_db_profile if (context or {}).get("mmseqs_mode_n") == "local_gpu" else ""
+            ),
+            "mmseqs_local_gpu": mmseqs_local_gpu if (context or {}).get("mmseqs_mode_n") == "local_gpu" else "",
+            "mmseqs_fallback": (context or {}).get("mmseqs_fallback_n", ""),
+            "context_metadata": (context or {}).get("context_metadata", {}),
+        },
+        "context_hash": (context or {}).get("context_hash", ""),
+        "template_count": len(groups),
+        "unique_binder_count": len(unique_binders),
+        "analyzed_binder_count": len(accepted),
+        "rejected_binder_count": len(rejected),
+        "recommended_run_flags": recommended_flags,
+        "resolved_mmseqs_mode": (context or {}).get("mmseqs_mode_n", ""),
+        "resolved_mmseqs_host_url": (context or {}).get("host_url", ""),
+        "resolved_mmseqs_db_tag": (context or {}).get("resolved_db_tag", ""),
+        "effective_cache_namespaces": sorted(
+            {
+                str(row.get("effective_msa_mode") or "")
+                for row in precompute_rows
+                if str(row.get("effective_msa_mode") or "")
+            }
+        ),
+        "summary_counts": {
+            "representative_cached": sum(1 for row in rep_fetch_rows if row.get("status") == "cached"),
+            "representative_fetched_and_cached": sum(
+                1 for row in rep_fetch_rows if row.get("status") == "fetched_and_cached"
+            ),
+            "representative_errors": sum(1 for row in rep_fetch_rows if row.get("status") == "error"),
+            "member_cached": sum(1 for row in member_rows if row.get("status") == "cached"),
+            "member_materialized": sum(1 for row in member_rows if row.get("status") == "materialized"),
+            "member_errors": sum(1 for row in member_rows if row.get("status") == "error"),
+        },
+        "errors": errors,
+    }
+
+    assignment_path = _write_dict_rows_csv(
+        output_root / "vhh_template_assignments.csv",
+        assignment_rows,
+        fieldnames=[
+            "binder_name_first",
+            "binder_sequence",
+            "binder_sequence_sha256",
+            "template_id",
+            "is_representative",
+            "group_size",
+            "template_grouping_mode",
+            "fr1",
+            "fr2",
+            "fr3",
+            "fr4",
+            "fr1_length",
+            "fr2_length",
+            "fr3_length",
+            "fr4_length",
+            "cdr1_length",
+            "cdr2_length",
+            "cdr3_length",
+            "cdr1_register",
+            "cdr2_register",
+            "cdr3_register",
+            "numbering_scheme",
+            "chain_class",
+        ],
+    )
+    summary_path = _write_dict_rows_csv(
+        output_root / "vhh_template_summary.csv",
+        template_summary_rows,
+        fieldnames=[
+            "template_id",
+            "representative_name",
+            "representative_sequence",
+            "group_size",
+            "template_grouping_mode",
+            "fr1_length",
+            "fr2_length",
+            "fr3_length",
+            "fr4_length",
+            "cdr1_length",
+            "cdr2_length",
+            "cdr3_length",
+            "representative_cache_key",
+            "member_cache_entries_written",
+            "status",
+        ],
+    )
+    rejected_path = _write_dict_rows_csv(
+        output_root / "rejected_binders.csv",
+        rejected,
+        fieldnames=["binder_name", "binder_sequence", "reason", "stage", "first_row_index"],
+    )
+    precompute_path = _write_dict_rows_csv(
+        output_root / "precompute_results.csv",
+        precompute_rows,
+        fieldnames=[
+            "record_type",
+            "template_id",
+            "binder_sequence_sha256",
+            "cache_key",
+            "status",
+            "elapsed_s",
+            "error",
+            "effective_msa_mode",
+        ],
+    )
+    manifest_path = output_root / "vhh_template_manifest.json"
+    _atomic_save_json(manifest_path, manifest)
+    recommended_flags_path = output_root / "recommended_run_flags.txt"
+    if emit_recommended_run_flags:
+        _atomic_write_text(recommended_flags_path, recommended_flags)
+
+    print("\nVHH TEMPLATE PREP")
+    print(f"Grouping mode          : {framework_mode_n}")
+    print(f"Pair rows              : {len(pair_rows)}")
+    print(f"Unique binders         : {len(unique_binders)}")
+    print(f"Accepted binders       : {len(accepted)}")
+    print(f"Rejected binders       : {len(rejected)}")
+    print(f"Template groups        : {len(groups)}")
+    print(f"Assignments CSV        : {assignment_path}")
+    print(f"Template summary CSV   : {summary_path}")
+    print(f"Rejected binders CSV   : {rejected_path}")
+    print(f"Precompute results CSV : {precompute_path}")
+    print(f"Manifest JSON          : {manifest_path}")
+    if emit_recommended_run_flags:
+        print(f"Recommended flags      : {recommended_flags_path}")
+
+    if strict_numbering and rejected:
+        raise RuntimeError(
+            f"Rejected {len(rejected)} binder sequence(s) during strict VHH numbering. "
+            f"See {rejected_path}."
+        )
+    if errors:
+        raise RuntimeError(f"prepare_vhh_binder_msas encountered errors. See {precompute_path}.")
+    if not accepted:
+        raise RuntimeError("No binders passed VHH analysis.")
 
 
 @app.function(
