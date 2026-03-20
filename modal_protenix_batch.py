@@ -3004,6 +3004,351 @@ def _run_ipsae(
     return parsed
 
 
+_PAIR_SUMMARY_HEADER = [
+    "task_id",
+    "pair_id",
+    "row_index",
+    "partner_role",
+    "partner_name",
+    "binder_name",
+    "binder_seq",
+    "target_name",
+    "target_seq",
+    "status",
+    "best_sample_scope",
+    "best_seed",
+    "best_sample_rank",
+    "n_candidates",
+    "n_interface_scored_candidates",
+    "best_iptm",
+    "iptm_mean",
+    "iptm_std",
+    "best_ptm",
+    "ptm_mean",
+    "ptm_std",
+    "best_ranking_score",
+    "ranking_score_mean",
+    "ranking_score_std",
+    "best_ipsae",
+    "ipsae_mean",
+    "ipsae_std",
+    "best_ipsae_d0chn",
+    "ipsae_d0chn_mean",
+    "ipsae_d0chn_std",
+    "best_ipsae_d0dom",
+    "ipsae_d0dom_mean",
+    "ipsae_d0dom_std",
+    "best_pdockq",
+    "pdockq_mean",
+    "pdockq_std",
+    "best_pdockq2",
+    "pdockq2_mean",
+    "pdockq2_std",
+    "best_lis",
+    "lis_mean",
+    "lis_std",
+    "ipsae_error",
+    "error",
+]
+_PAIR_SUMMARY_INTEGER_FIELDS = {
+    "row_index",
+    "best_seed",
+    "best_sample_rank",
+    "n_candidates",
+    "n_interface_scored_candidates",
+}
+_PAIR_SUMMARY_FLOAT_FIELDS = {
+    "best_iptm",
+    "iptm_mean",
+    "iptm_std",
+    "best_ptm",
+    "ptm_mean",
+    "ptm_std",
+    "best_ranking_score",
+    "ranking_score_mean",
+    "ranking_score_std",
+    "best_ipsae",
+    "ipsae_mean",
+    "ipsae_std",
+    "best_ipsae_d0chn",
+    "ipsae_d0chn_mean",
+    "ipsae_d0chn_std",
+    "best_ipsae_d0dom",
+    "ipsae_d0dom_mean",
+    "ipsae_d0dom_std",
+    "best_pdockq",
+    "pdockq_mean",
+    "pdockq_std",
+    "best_pdockq2",
+    "pdockq2_mean",
+    "pdockq2_std",
+    "best_lis",
+    "lis_mean",
+    "lis_std",
+}
+_PAIR_SUMMARY_PROTENIX_METRICS = [
+    ("iptm", "best_iptm", "iptm_mean", "iptm_std"),
+    ("ptm", "best_ptm", "ptm_mean", "ptm_std"),
+    ("ranking_score", "best_ranking_score", "ranking_score_mean", "ranking_score_std"),
+]
+_PAIR_SUMMARY_INTERFACE_METRICS = [
+    ("ipSAE", "best_ipsae", "ipsae_mean", "ipsae_std"),
+    ("ipSAE_d0chn", "best_ipsae_d0chn", "ipsae_d0chn_mean", "ipsae_d0chn_std"),
+    ("ipSAE_d0dom", "best_ipsae_d0dom", "ipsae_d0dom_mean", "ipsae_d0dom_std"),
+    ("pDockQ", "best_pdockq", "pdockq_mean", "pdockq_std"),
+    ("pDockQ2", "best_pdockq2", "pdockq2_mean", "pdockq2_std"),
+    ("LIS", "best_lis", "lis_mean", "lis_std"),
+]
+_CANDIDATE_INTERFACE_METRIC_KEYS = tuple(metric for metric, _, _, _ in _PAIR_SUMMARY_INTERFACE_METRICS)
+
+
+def _finite_float_or_none(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+
+    parsed: Optional[float] = None
+    if isinstance(value, bool):
+        parsed = float(int(value))
+    elif isinstance(value, (int, float)):
+        parsed = float(value)
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.startswith("'"):
+            text = text[1:].strip()
+        if not text:
+            return None
+        try:
+            parsed = float(text)
+        except ValueError:
+            return None
+
+    if parsed is None or not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _normalize_interface_metrics(payload: Dict[str, Any]) -> Dict[str, float]:
+    metrics: Dict[str, float] = {}
+    for key in _CANDIDATE_INTERFACE_METRIC_KEYS:
+        value = _finite_float_or_none(payload.get(key))
+        if value is not None:
+            metrics[key] = value
+    return metrics
+
+
+def _normalize_compact_error_text(message: Any, *, limit: int = 160) -> str:
+    text = " ".join(str(message or "").split())
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _candidate_has_valid_ipsae(candidate: Dict[str, Any]) -> bool:
+    metrics = candidate.get("interface_metrics", {}) or {}
+    return _finite_float_or_none(metrics.get("ipSAE")) is not None
+
+
+def _score_candidate_interfaces(
+    candidates: Sequence[Dict[str, Any]],
+    *,
+    adapter_dir: Path,
+    pae_cutoff: float,
+    dist_cutoff: float,
+    binder_chains: Sequence[str],
+    partner_chains: Sequence[str],
+) -> None:
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+    for candidate in candidates:
+        interface_result: Dict[str, Any]
+        try:
+            adapted_full_path, _ = _write_ipsae_adapter_files(
+                full_data_path=Path(candidate["full_data_path"]),
+                summary_path=Path(candidate["summary_path"]),
+                out_dir=adapter_dir,
+            )
+            interface_result = _run_ipsae(
+                adapted_full_path=adapted_full_path,
+                cif_path=Path(candidate["cif_path"]),
+                pae_cutoff=pae_cutoff,
+                dist_cutoff=dist_cutoff,
+                binder_chains=binder_chains,
+                partner_chains=partner_chains,
+            )
+        except Exception as exc:  # noqa: BLE001
+            interface_result = {"error": str(exc)}
+
+        interface_metrics = _normalize_interface_metrics(interface_result)
+        interface_error = _normalize_compact_error_text(interface_result.get("error"))
+        if _finite_float_or_none(interface_metrics.get("ipSAE")) is None and not interface_error:
+            interface_error = "ipsae produced no valid ipSAE"
+
+        candidate["interface_metrics"] = interface_metrics
+        candidate["interface_error"] = interface_error or None
+        candidate["interface_result"] = dict(interface_result)
+        if candidate["interface_error"] and "error" not in candidate["interface_result"]:
+            candidate["interface_result"]["error"] = candidate["interface_error"]
+
+
+def _candidate_manifest_entry(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    summary = candidate.get("summary", {})
+    if not isinstance(summary, dict):
+        summary = {}
+
+    return {
+        "seed": int(candidate["seed"]),
+        "sample_rank": int(candidate["sample_rank"]),
+        "iptm": _finite_float_or_none(summary.get("iptm")),
+        "ptm": _finite_float_or_none(summary.get("ptm")),
+        "ranking_score": _finite_float_or_none(summary.get("ranking_score")),
+        "summary": summary,
+        "interface_metrics": dict(candidate.get("interface_metrics", {}) or {}),
+        "interface_error": candidate.get("interface_error"),
+    }
+
+
+def _build_candidate_manifest(candidates: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        _candidate_manifest_entry(candidate)
+        for candidate in sorted(candidates, key=lambda x: (int(x["seed"]), int(x["sample_rank"])))
+    ]
+
+
+def _best_candidate_ipsae_payload(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(candidate.get("interface_result", {}) or {})
+    for key, value in (candidate.get("interface_metrics", {}) or {}).items():
+        payload[key] = value
+    if candidate.get("interface_error") and not payload.get("error"):
+        payload["error"] = candidate["interface_error"]
+    return payload
+
+
+def _numeric_metric_stats(values: Sequence[Any]) -> Dict[str, Any]:
+    numbers = [value for value in (_finite_float_or_none(item) for item in values) if value is not None]
+    if not numbers:
+        return {"mean": None, "std": None, "n": 0}
+
+    mean_value = sum(numbers) / len(numbers)
+    if len(numbers) == 1:
+        std_value = 0.0
+    else:
+        variance = sum((value - mean_value) ** 2 for value in numbers) / len(numbers)
+        std_value = math.sqrt(variance)
+        if abs(std_value) < 1e-12:
+            std_value = 0.0
+
+    return {"mean": mean_value, "std": std_value, "n": len(numbers)}
+
+
+def _find_candidate_summary(
+    candidates: Sequence[Dict[str, Any]],
+    *,
+    seed: Any,
+    sample_rank: Any,
+) -> Optional[Dict[str, Any]]:
+    seed_value = _finite_float_or_none(seed)
+    rank_value = _finite_float_or_none(sample_rank)
+    if seed_value is None or rank_value is None:
+        return None
+
+    seed_int = int(seed_value)
+    rank_int = int(rank_value)
+    for candidate in candidates:
+        if int(candidate.get("seed", -1)) == seed_int and int(candidate.get("sample_rank", -1)) == rank_int:
+            return candidate
+    return None
+
+
+def _summarize_interface_errors(candidates: Sequence[Dict[str, Any]], *, n_candidates: int) -> str:
+    failures = 0
+    first_error = ""
+    for candidate in candidates:
+        if _candidate_has_valid_ipsae(candidate):
+            continue
+        failures += 1
+        if not first_error:
+            first_error = _normalize_compact_error_text(candidate.get("interface_error"))
+
+    if failures == 0:
+        return ""
+
+    summary = f"{failures}/{n_candidates} candidate interface scorings failed"
+    if first_error:
+        return f"{summary}; first_error={first_error}"
+    return summary
+
+
+def _build_pair_summary_row(result: Dict[str, Any]) -> Dict[str, Any]:
+    row: Dict[str, Any] = {field: "" for field in _PAIR_SUMMARY_HEADER}
+    row.update(
+        {
+            "task_id": result.get("task_id"),
+            "pair_id": result.get("pair_id"),
+            "row_index": result.get("row_index"),
+            "partner_role": result.get("partner_role"),
+            "partner_name": result.get("partner_name"),
+            "binder_name": result.get("binder_name"),
+            "binder_seq": result.get("binder_seq"),
+            "target_name": result.get("target_name"),
+            "target_seq": result.get("target_seq"),
+            "status": result.get("status"),
+            "best_sample_scope": result.get("selection_scope"),
+            "best_seed": result.get("best_seed"),
+            "best_sample_rank": result.get("best_sample_rank"),
+            "error": result.get("error"),
+        }
+    )
+    if result.get("status") != "success":
+        return row
+
+    raw = result.get("protenix_raw", {}) or {}
+    candidate_summaries = raw.get("candidate_summaries", []) or []
+    if not isinstance(candidate_summaries, list):
+        candidate_summaries = []
+
+    n_candidates = len(candidate_summaries)
+    row["n_candidates"] = n_candidates
+    row["n_interface_scored_candidates"] = sum(
+        1 for candidate in candidate_summaries if _candidate_has_valid_ipsae(candidate)
+    )
+
+    best_candidate = _find_candidate_summary(
+        candidate_summaries,
+        seed=result.get("best_seed"),
+        sample_rank=result.get("best_sample_rank"),
+    )
+    best_interface_metrics = (best_candidate or {}).get("interface_metrics", {}) or {}
+
+    for metric_key, best_field, mean_field, std_field in _PAIR_SUMMARY_PROTENIX_METRICS:
+        values = [candidate.get(metric_key) for candidate in candidate_summaries]
+        stats = _numeric_metric_stats(values)
+        if best_candidate is not None:
+            best_value = _finite_float_or_none(best_candidate.get(metric_key))
+        else:
+            best_value = _finite_float_or_none(result.get(best_field))
+        row[best_field] = best_value
+        row[mean_field] = stats["mean"]
+        row[std_field] = stats["std"]
+
+    for metric_key, best_field, mean_field, std_field in _PAIR_SUMMARY_INTERFACE_METRICS:
+        values = [
+            (candidate.get("interface_metrics", {}) or {}).get(metric_key)
+            for candidate in candidate_summaries
+        ]
+        stats = _numeric_metric_stats(values)
+        row[best_field] = _finite_float_or_none(best_interface_metrics.get(metric_key))
+        row[mean_field] = stats["mean"]
+        row[std_field] = stats["std"]
+
+    row["ipsae_error"] = _summarize_interface_errors(candidate_summaries, n_candidates=n_candidates)
+    return row
+
+
 # =============================================================================
 # PROTENIX TASK EXECUTION
 # =============================================================================
@@ -3736,10 +4081,13 @@ def _run_protenix_task_impl(task: Dict[str, Any]) -> Dict[str, Any]:
         best_summary = best["summary"]
         best_cif_path = Path(best["cif_path"])
         best_full_data_path = Path(best["full_data_path"])
-        best_summary_path = Path(best["summary_path"])
 
         best_cif = best_cif_path.read_text()
         best_full_data = _load_json(best_full_data_path)
+
+        best_iptm_value = _finite_float_or_none(best_summary.get("iptm"))
+        best_ptm_value = _finite_float_or_none(best_summary.get("ptm"))
+        best_ranking_score_value = _finite_float_or_none(best_summary.get("ranking_score"))
 
         emit(
             "best_selected",
@@ -3748,54 +4096,34 @@ def _run_protenix_task_impl(task: Dict[str, Any]) -> Dict[str, Any]:
                 "stage": "selection",
                 "seed": int(best["seed"]),
                 "sample_rank": int(best["sample_rank"]),
-                "best_iptm": float(best_summary.get("iptm", -1.0)),
-                "best_ptm": float(best_summary.get("ptm", -1.0)),
-                "best_ranking_score": float(best_summary.get("ranking_score", -1.0)),
+                "best_iptm": best_iptm_value,
+                "best_ptm": best_ptm_value,
+                "best_ranking_score": best_ranking_score_value,
                 "cif_text": best_cif,
                 "summary_confidence_json": best_summary,
                 "full_data_json": best_full_data,
             },
         )
 
-        candidate_manifest = [
-            {
-                "seed": int(c["seed"]),
-                "sample_rank": int(c["sample_rank"]),
-                "iptm": float(c["iptm"]),
-                "ptm": float(c["ptm"]),
-                "ranking_score": float(c["ranking_score"]),
-                "summary": c["summary"],
-            }
-            for c in sorted(candidates, key=lambda x: (int(x["seed"]), int(x["sample_rank"])))
-        ]
-
-        ipsae_metrics: Dict[str, Any] = {}
-        try:
-            adapter_dir = work_dir / "ipsae_adapter"
-            adapted_full_path, _ = _write_ipsae_adapter_files(
-                full_data_path=best_full_data_path,
-                summary_path=best_summary_path,
-                out_dir=adapter_dir,
-            )
-            ipsae_metrics = _run_ipsae(
-                adapted_full_path=adapted_full_path,
-                cif_path=best_cif_path,
-                pae_cutoff=float(task["pae_cutoff"]),
-                dist_cutoff=float(task["dist_cutoff"]),
-                binder_chains=chain_map["binder"],
-                partner_chains=chain_map["partner"],
-            )
-        except Exception as exc:  # noqa: BLE001
-            ipsae_metrics = {"error": str(exc)}
+        _score_candidate_interfaces(
+            candidates,
+            adapter_dir=work_dir / "ipsae_adapter",
+            pae_cutoff=float(task["pae_cutoff"]),
+            dist_cutoff=float(task["dist_cutoff"]),
+            binder_chains=chain_map["binder"],
+            partner_chains=chain_map["partner"],
+        )
+        candidate_manifest = _build_candidate_manifest(candidates)
+        ipsae_metrics = _best_candidate_ipsae_payload(best)
 
         result.update(
             {
                 "status": "success",
                 "best_seed": best["seed"],
                 "best_sample_rank": best["sample_rank"],
-                "best_iptm": float(best_summary.get("iptm", -1.0)),
-                "best_ptm": float(best_summary.get("ptm", -1.0)),
-                "best_ranking_score": float(best_summary.get("ranking_score", -1.0)),
+                "best_iptm": best_iptm_value,
+                "best_ptm": best_ptm_value,
+                "best_ranking_score": best_ranking_score_value,
                 "best_summary": best_summary,
                 "best_cif": best_cif,
                 "n_candidates": len(candidates),
@@ -3826,7 +4154,7 @@ def _run_protenix_task_impl(task: Dict[str, Any]) -> Dict[str, Any]:
                 "n_candidates": len(candidates),
                 "best_seed": int(best["seed"]),
                 "best_sample_rank": int(best["sample_rank"]),
-                "best_iptm": float(best_summary.get("iptm", -1.0)),
+                "best_iptm": best_iptm_value,
             },
         )
 
@@ -3978,50 +4306,33 @@ def _run_protenix_task_batch_impl(tasks: Sequence[Dict[str, Any]]) -> List[Dict[
                 best_summary = best["summary"]
                 best_cif_path = Path(best["cif_path"])
                 best_full_data_path = Path(best["full_data_path"])
-                best_summary_path = Path(best["summary_path"])
 
                 best_cif = best_cif_path.read_text()
                 best_full_data = _load_json(best_full_data_path)
 
-                candidate_manifest = [
-                    {
-                        "seed": int(c["seed"]),
-                        "sample_rank": int(c["sample_rank"]),
-                        "iptm": float(c["iptm"]),
-                        "ptm": float(c["ptm"]),
-                        "ranking_score": float(c["ranking_score"]),
-                        "summary": c["summary"],
-                    }
-                    for c in sorted(candidates, key=lambda x: (int(x["seed"]), int(x["sample_rank"])))
-                ]
+                best_iptm_value = _finite_float_or_none(best_summary.get("iptm"))
+                best_ptm_value = _finite_float_or_none(best_summary.get("ptm"))
+                best_ranking_score_value = _finite_float_or_none(best_summary.get("ranking_score"))
 
-                ipsae_metrics: Dict[str, Any] = {}
-                try:
-                    adapter_dir = work_dir / "ipsae_adapter"
-                    adapted_full_path, _ = _write_ipsae_adapter_files(
-                        full_data_path=best_full_data_path,
-                        summary_path=best_summary_path,
-                        out_dir=adapter_dir,
-                    )
-                    ipsae_metrics = _run_ipsae(
-                        adapted_full_path=adapted_full_path,
-                        cif_path=best_cif_path,
-                        pae_cutoff=float(t["pae_cutoff"]),
-                        dist_cutoff=float(t["dist_cutoff"]),
-                        binder_chains=chain_map["binder"],
-                        partner_chains=chain_map["partner"],
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    ipsae_metrics = {"error": str(exc)}
+                _score_candidate_interfaces(
+                    candidates,
+                    adapter_dir=work_dir / "ipsae_adapter",
+                    pae_cutoff=float(t["pae_cutoff"]),
+                    dist_cutoff=float(t["dist_cutoff"]),
+                    binder_chains=chain_map["binder"],
+                    partner_chains=chain_map["partner"],
+                )
+                candidate_manifest = _build_candidate_manifest(candidates)
+                ipsae_metrics = _best_candidate_ipsae_payload(best)
 
                 results_by_task_id[tid].update(
                     {
                         "status": "success",
                         "best_seed": best["seed"],
                         "best_sample_rank": best["sample_rank"],
-                        "best_iptm": float(best_summary.get("iptm", -1.0)),
-                        "best_ptm": float(best_summary.get("ptm", -1.0)),
-                        "best_ranking_score": float(best_summary.get("ranking_score", -1.0)),
+                        "best_iptm": best_iptm_value,
+                        "best_ptm": best_ptm_value,
+                        "best_ranking_score": best_ranking_score_value,
                         "best_summary": best_summary,
                         "best_cif": best_cif,
                         "n_candidates": len(candidates),
@@ -4428,59 +4739,20 @@ def _write_summary_csv(output_root: Path, results: Sequence[Dict[str, Any]]) -> 
         return int(parsed) if integer else parsed
 
     csv_path = output_root / "pair_summary.csv"
-    header = [
-        "task_id",
-        "pair_id",
-        "row_index",
-        "partner_role",
-        "partner_name",
-        "binder_name",
-        "binder_seq",
-        "target_name",
-        "target_seq",
-        "status",
-        "best_sample_scope",
-        "best_seed",
-        "best_sample_rank",
-        "best_iptm",
-        "best_ptm",
-        "best_ranking_score",
-        "ipsae",
-        "ipsae_d0chn",
-        "ipsae_d0dom",
-        "ipsae_error",
-        "error",
-    ]
+
+    def _normalize_summary_cell(field: str, value: Any) -> Any:
+        if field in _PAIR_SUMMARY_INTEGER_FIELDS:
+            return _coerce_numeric_cell(value, integer=True)
+        if field in _PAIR_SUMMARY_FLOAT_FIELDS:
+            return _coerce_numeric_cell(value)
+        return "" if value is None else value
+
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(header)
+        w = csv.DictWriter(f, fieldnames=_PAIR_SUMMARY_HEADER, extrasaction="ignore")
+        w.writeheader()
         for r in results:
-            ipsae = r.get("ipsae", {}) or {}
-            w.writerow(
-                [
-                    r.get("task_id"),
-                    r.get("pair_id"),
-                    _coerce_numeric_cell(r.get("row_index"), integer=True),
-                    r.get("partner_role"),
-                    r.get("partner_name"),
-                    r.get("binder_name"),
-                    r.get("binder_seq"),
-                    r.get("target_name"),
-                    r.get("target_seq"),
-                    r.get("status"),
-                    r.get("selection_scope"),
-                    _coerce_numeric_cell(r.get("best_seed"), integer=True),
-                    _coerce_numeric_cell(r.get("best_sample_rank"), integer=True),
-                    _coerce_numeric_cell(r.get("best_iptm")),
-                    _coerce_numeric_cell(r.get("best_ptm")),
-                    _coerce_numeric_cell(r.get("best_ranking_score")),
-                    _coerce_numeric_cell(ipsae.get("ipSAE")),
-                    _coerce_numeric_cell(ipsae.get("ipSAE_d0chn")),
-                    _coerce_numeric_cell(ipsae.get("ipSAE_d0dom")),
-                    ipsae.get("error"),
-                    r.get("error"),
-                ]
-            )
+            row = _build_pair_summary_row(r)
+            w.writerow({field: _normalize_summary_cell(field, row.get(field)) for field in _PAIR_SUMMARY_HEADER})
     return csv_path
 
 
@@ -4678,7 +4950,11 @@ def _redact_event(event: Dict[str, Any], artifact_paths: List[str], stale_epoch:
     return redacted
 
 
-def _save_stream_event(output_root: Path, dict_key: str, event: Dict[str, Any]) -> None:
+def _save_stream_event(
+    output_root: Path,
+    dict_key: str,
+    event: Dict[str, Any],
+) -> None:
     task_id = str(event.get("task_id", "unknown_task"))
     pair_id, role = _parse_task_id(task_id)
     attempt = int(event.get("attempt", 0))
@@ -5016,7 +5292,11 @@ def _sync_worker(
                     st["header_dict_key"] = str(key)
                     st["header_event"] = dict(payload)
                     chunk_state[ckey] = st
-                    _save_stream_event(output_root=output_dir, dict_key=key, event=payload)
+                    _save_stream_event(
+                        output_root=output_dir,
+                        dict_key=key,
+                        event=payload,
+                    )
                     _track_stream_watermark(state, payload)
                 elif event_type == "chunk":
                     t = str(payload.get("task_id", "unknown_task"))
@@ -5067,7 +5347,11 @@ def _sync_worker(
                             applied_ids.add(marker)
                             chunk_state.pop(ckey, None)
                 else:
-                    _save_stream_event(output_root=output_dir, dict_key=key, event=payload)
+                    _save_stream_event(
+                        output_root=output_dir,
+                        dict_key=key,
+                        event=payload,
+                    )
                     _track_stream_watermark(state, payload)
             else:
                 if _result_already_applied(state, payload):

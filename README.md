@@ -466,10 +466,27 @@ modal run modal_protenix_batch.py::test_connection --gpu A100-80GB
 - `binder_name`, `binder_seq`
 - `target_name`, `target_seq`
 - `status`
-- `best_sample_scope`, `best_seed`, `best_sample_rank`
-- `best_iptm`, `best_ptm`, `best_ranking_score`
-- `ipsae`, `ipsae_d0chn`, `ipsae_d0dom`, `ipsae_error`
+- `best_sample_scope`, `best_seed`, `best_sample_rank`, `n_candidates`, `n_interface_scored_candidates`
+- `best_iptm`, `iptm_mean`, `iptm_std`
+- `best_ptm`, `ptm_mean`, `ptm_std`
+- `best_ranking_score`, `ranking_score_mean`, `ranking_score_std`
+- `best_ipsae`, `ipsae_mean`, `ipsae_std`
+- `best_ipsae_d0chn`, `ipsae_d0chn_mean`, `ipsae_d0chn_std`
+- `best_ipsae_d0dom`, `ipsae_d0dom_mean`, `ipsae_d0dom_std`
+- `best_pdockq`, `pdockq_mean`, `pdockq_std`
+- `best_pdockq2`, `pdockq2_mean`, `pdockq2_std`
+- `best_lis`, `lis_mean`, `lis_std`
+- `ipsae_error`
 - `error`
+
+Count semantics:
+
+- `n_candidates` is the number of successful Protenix candidate structures collected for the pair.
+- `n_interface_scored_candidates` is the number of candidates whose stored interface metrics include a valid numeric `ipSAE`.
+
+Interface metric note:
+
+- `pDockQ`, `pDockQ2`, and `LIS` are prediction-derived interface metrics from `ipsae.py`, not true `DockQ`.
 
 ## Notes
 
@@ -482,4 +499,5 @@ modal run modal_protenix_batch.py::test_connection --gpu A100-80GB
 - In local mode, `--mmseqs-db-tag` should match the tag used with either `init_mmseqs_uniref100_db` or `modal_build_uniref100_db.py`.
 - `fixed_msa` mode performs warn-only compatibility checks against binder sequences.
 - Best-structure selection is based on highest `iptm`.
+- `target.ipsae.json` remains the best-candidate interface-scoring artifact; per-candidate interface metrics are stored in `protenix_raw.candidate_summaries`.
 - `run_metadata.json` captures key run configuration and run-level status for reproducibility.

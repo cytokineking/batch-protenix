@@ -35,3 +35,4 @@ pip-wheel-metadata/
 runs/
 plans/
 *.csv
+tests/
