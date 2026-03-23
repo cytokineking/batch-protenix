@@ -315,6 +315,8 @@ ready tasks into a single Protenix invocation to amortize model load.
 - `--gpu <type>` (default: `A100-80GB`)
 - `--max-parallel <int>` (default: `1`)
   - Max concurrent inference task executions.
+- `--by-target-include-best-full-data <bool>` (default: `false`)
+  - When enabled, exports the selected top-sample `full_data.json` next to the selected `.cif` in `by_target/<target>/`.
 - Streaming is always enabled for this pipeline.
 - `--stream-logs <bool>` (default: `true`)
 - `--log-chunk-seconds <float>` (default: `1.0`)
@@ -428,6 +430,92 @@ modal run modal_protenix_batch.py::list_gpus
 modal run modal_protenix_batch.py::test_connection --gpu A100-80GB
 ```
 
+## Epitope Analysis Utility
+
+For post-run structural epitope binning on grouped `mmCIF` outputs, use:
+
+```bash
+python scripts/epitope_binning_analysis.py \
+  --cif-dir runs/PV2_cluster88/pv2_cluster88_gpa33_ontarget/by_target/gpa33 \
+  --pair-summary runs/PV2_cluster88/pv2_cluster88_gpa33_ontarget/pair_summary.csv \
+  --comparison-csv runs/PV2_cluster88/pv2_cluster88_analysis/vhh_target_decoy_comparison.csv \
+  --target-name GPA33 \
+  --outdir runs/PV2_cluster88/pv2_cluster88_gpa33_ontarget/epitope_analysis
+```
+
+Defaults:
+
+- binder chain: `A`
+- target chain: `B`
+- contact cutoff: `4.5 A`
+- `ipSAE` threshold: `0.6`
+
+### Analysis modes
+
+Default mode analyzes only successful complexes with `best_ipsae > --ipsae-threshold`:
+
+```bash
+python scripts/epitope_binning_analysis.py ... --ipsae-threshold 0.6
+```
+
+Optional exploratory mode analyzes all successful complexes and marks which ones pass the same threshold:
+
+```bash
+python scripts/epitope_binning_analysis.py ... \
+  --ipsae-threshold 0.6 \
+  --include-all-successful
+```
+
+Interpretation:
+
+- default mode: `--ipsae-threshold` is used for filtering
+- `--include-all-successful` mode: `--ipsae-threshold` is used for pass/fail annotation and bin-level quality summaries
+
+Helpful flags:
+
+- `--binder-chain <id>` / `--target-chain <id>`
+- `--contact-cutoff <angstrom>`
+- `--jaccard-distance-threshold <float>`
+- `--approach-angle-threshold-deg <float>`
+- `--interface-centroid-threshold <float>`
+- `--representative-mode {highest_ipsae,medoid}`
+- `--write-aligned-cifs` / `--no-write-aligned-cifs`
+- `--comparison-csv <path>` for optional off-target annotation
+
+### Epitope analysis outputs
+
+`--outdir` from `epitope_binning_analysis.py` contains:
+
+- `analyzed_complexes.csv`
+  - one row per analyzed complex
+  - includes `ipsae_threshold_used` and `passes_ipsae_threshold`
+- `filtered_binders.csv`
+  - compatibility alias of `analyzed_complexes.csv`
+  - in `--include-all-successful` mode, this file still includes complexes that do not pass the threshold; use `passes_ipsae_threshold` to distinguish them
+- `per_complex_geometry.csv`
+  - one row per analyzed complex with contact counts, aligned centroids, approach vector, bin IDs, and threshold annotation fields
+- `epitope_bins.csv`
+  - binder-to-bin assignment table with confidence annotations, including `ipsae_threshold_used` and `passes_ipsae_threshold`
+- `bin_summary.csv`
+  - one row per final bin with:
+    - `bin_size_all`
+    - `bin_size_ipsae_pass`
+    - `fraction_ipsae_pass`
+    - summary stats for `best_ipsae`, `best_iptm`, and `best_pdockq2`
+    - representative binder fields
+    - consensus epitope residue sets
+    - within-bin geometry summaries
+- `target_residue_occupancy.csv`
+  - campaign-level target residue occupancy map
+- `bin_offtarget_annotation.csv`
+  - optional off-target / decoy summaries per `(final_bin_id, target_name_off)`
+- `bin_consensus_epitopes.json`
+- `analysis_metadata.json`
+- `aligned_representatives/`
+  - optional aligned representative `mmCIF` files, one per final bin when aligned CIF writing is enabled
+- `figures/`
+  - occupancy, clustering, and geometry summary plots
+
 ## Output Layout
 
 `--output-dir` contains:
@@ -457,6 +545,7 @@ modal run modal_protenix_batch.py::test_connection --gpu A100-80GB
   by_target/
     <target_slug>/
       <binder_slug>__vs__<target_slug>__<short_hash>.cif
+      <binder_slug>__vs__<target_slug>__<short_hash>.full_data.json  # optional; when enabled
 ```
 
 `pair_summary.csv` columns:

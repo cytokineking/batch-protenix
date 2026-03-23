@@ -34,5 +34,6 @@ pip-wheel-metadata/
 # Development files
 runs/
 plans/
+docs/
 *.csv
 tests/

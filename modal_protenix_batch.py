@@ -473,6 +473,13 @@ def _atomic_save_json(path: Path, payload: Dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def _atomic_copy_file(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + f".tmp.{uuid.uuid4().hex}")
+    shutil.copy2(src, tmp)
+    os.replace(tmp, dst)
+
+
 def _dict_get(d: modal.Dict, key: str, default: Any = None) -> Any:
     try:
         return d[key]
@@ -4126,6 +4133,7 @@ def _run_protenix_task_impl(task: Dict[str, Any]) -> Dict[str, Any]:
                 "best_ranking_score": best_ranking_score_value,
                 "best_summary": best_summary,
                 "best_cif": best_cif,
+                "best_full_data_json": best_full_data,
                 "n_candidates": len(candidates),
                 "per_seed_best": [
                     {
@@ -4335,6 +4343,7 @@ def _run_protenix_task_batch_impl(tasks: Sequence[Dict[str, Any]]) -> List[Dict[
                         "best_ranking_score": best_ranking_score_value,
                         "best_summary": best_summary,
                         "best_cif": best_cif,
+                        "best_full_data_json": best_full_data,
                         "n_candidates": len(candidates),
                         "per_seed_best": [
                             {
@@ -4613,6 +4622,95 @@ def _pair_role_paths(output_root: Path, pair_id: str, role: str) -> Dict[str, Pa
     }
 
 
+def _by_target_export_paths(
+    output_root: Path,
+    pair_id: str,
+    *,
+    binder_name: Any = None,
+    target_name: Any = None,
+    row_index: Any = None,
+) -> Optional[Dict[str, Path]]:
+    binder_text = "" if binder_name is None else str(binder_name)
+    target_text = "" if target_name is None else str(target_name)
+    row_value = row_index
+    if not binder_text or not target_text or row_value in {None, ""}:
+        pair_json = _pair_role_paths(output_root, pair_id, "target")["pair_json"]
+        if pair_json.exists():
+            try:
+                pair_payload = _load_json(pair_json)
+            except Exception:  # noqa: BLE001
+                pair_payload = {}
+            binder_text = binder_text or str(pair_payload.get("binder_name", ""))
+            target_text = target_text or str(pair_payload.get("target_name", ""))
+            if row_value in {None, ""}:
+                row_value = pair_payload.get("row_index")
+
+    if not binder_text or not target_text or row_value in {None, ""}:
+        return None
+
+    binder_slug = _slugify(binder_text)
+    target_slug = _slugify(target_text)
+    pair_hash = _short_hash(f"{binder_text}|{target_text}|{row_value}")
+    stem = f"{binder_slug}__vs__{target_slug}__{pair_hash}"
+    grouped_dir = output_root / "by_target" / target_slug
+    return {
+        "grouped_dir": grouped_dir,
+        "best_cif": grouped_dir / f"{stem}.cif",
+        "best_full_data": grouped_dir / f"{stem}.full_data.json",
+    }
+
+
+def _export_by_target_selected_artifacts(
+    output_root: Path,
+    *,
+    pair_id: str,
+    role: str,
+    best_cif_text: Any = None,
+    include_best_full_data: bool = False,
+    best_full_data_json: Optional[Dict[str, Any]] = None,
+    best_seed: Any = None,
+    best_sample_rank: Any = None,
+    binder_name: Any = None,
+    target_name: Any = None,
+    row_index: Any = None,
+) -> None:
+    if role != "target":
+        return
+
+    export_paths = _by_target_export_paths(
+        output_root,
+        pair_id,
+        binder_name=binder_name,
+        target_name=target_name,
+        row_index=row_index,
+    )
+    if export_paths is None:
+        return
+
+    export_paths["grouped_dir"].mkdir(parents=True, exist_ok=True)
+    if isinstance(best_cif_text, str) and best_cif_text:
+        _atomic_write_text(export_paths["best_cif"], best_cif_text)
+
+    if not include_best_full_data:
+        return
+
+    if isinstance(best_full_data_json, dict):
+        _atomic_save_json(export_paths["best_full_data"], _to_jsonable(best_full_data_json))
+        return
+
+    seed_value = _finite_float_or_none(best_seed)
+    rank_value = _finite_float_or_none(best_sample_rank)
+    if seed_value is None or rank_value is None:
+        return
+
+    candidate_full_data = (
+        _pair_role_paths(output_root, pair_id, role)["candidates_dir"]
+        / f"s{int(seed_value)}_n{int(rank_value)}.full_data.json"
+    )
+    if candidate_full_data.exists():
+        _atomic_copy_file(candidate_full_data, export_paths["best_full_data"])
+
+
 def _merge_status_file(path: Path, patch: Dict[str, Any]) -> None:
     cur = _load_task_status(path) or {}
     cur.update(_to_jsonable(patch))
@@ -4625,7 +4723,12 @@ def _authoritative_epoch(output_root: Path, pair_id: str, role: str) -> Tuple[in
     return int(status.get("attempt", 0)), int(status.get("lease_epoch", 0))
 
 
-def _save_task_result(output_root: Path, result: Dict[str, Any]) -> None:
+def _save_task_result(
+    output_root: Path,
+    result: Dict[str, Any],
+    *,
+    by_target_include_best_full_data: bool = False,
+) -> None:
     pair_id = str(result["pair_id"])
     role = str(result["partner_role"])
     attempt = int(result.get("attempt", 1))
@@ -4653,7 +4756,9 @@ def _save_task_result(output_root: Path, result: Dict[str, Any]) -> None:
         "target_seq": result.get("target_seq"),
     }
     _atomic_save_json(p["pair_json"], _to_jsonable(pair_payload))
-    _atomic_save_json(p["metrics"], _to_jsonable(result))
+    metrics_payload = dict(result)
+    metrics_payload.pop("best_full_data_json", None)
+    _atomic_save_json(p["metrics"], _to_jsonable(metrics_payload))
 
     status_payload = {
         "task_id": result.get("task_id"),
@@ -4697,17 +4802,20 @@ def _save_task_result(output_root: Path, result: Dict[str, Any]) -> None:
                     p["candidates_dir"] / f"s{seed}_n{sample_rank}.summary.json",
                     summary,
                 )
-
-    if role == "target":
-        binder_slug = _slugify(result.get("binder_name", "binder"))
-        target_slug = _slugify(result.get("target_name", "target"))
-        pair_hash = _short_hash(
-            f"{result.get('binder_name','')}|{result.get('target_name','')}|{result.get('row_index',0)}"
-        )
-        out_name = f"{binder_slug}__vs__{target_slug}__{pair_hash}.cif"
-        grouped_dir = output_root / "by_target" / target_slug
-        grouped_dir.mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(grouped_dir / out_name, str(result.get("best_cif", "")))
+    raw_best_selected = raw.get("best_selected", {}) or {}
+    _export_by_target_selected_artifacts(
+        output_root,
+        pair_id=pair_id,
+        role=role,
+        best_cif_text=result.get("best_cif"),
+        include_best_full_data=by_target_include_best_full_data,
+        best_full_data_json=result.get("best_full_data_json") or raw_best_selected.get("full_data_json"),
+        best_seed=result.get("best_seed"),
+        best_sample_rank=result.get("best_sample_rank"),
+        binder_name=result.get("binder_name"),
+        target_name=result.get("target_name"),
+        row_index=result.get("row_index"),
+    )
 
 
 def _write_summary_csv(output_root: Path, results: Sequence[Dict[str, Any]]) -> Path:
@@ -4954,6 +5062,8 @@ def _save_stream_event(
     output_root: Path,
     dict_key: str,
     event: Dict[str, Any],
+    *,
+    by_target_include_best_full_data: bool = False,
 ) -> None:
     task_id = str(event.get("task_id", "unknown_task"))
     pair_id, role = _parse_task_id(task_id)
@@ -5004,6 +5114,15 @@ def _save_stream_event(
             if isinstance(event.get("summary_confidence_json"), dict):
                 _atomic_save_json(p["best_summary"], _to_jsonable(event["summary_confidence_json"]))
                 artifact_paths.append(str(p["best_summary"].relative_to(output_root)))
+            if role == "target":
+                _export_by_target_selected_artifacts(
+                    output_root,
+                    pair_id=pair_id,
+                    role=role,
+                    best_cif_text=event.get("cif_text"),
+                    include_best_full_data=by_target_include_best_full_data,
+                    best_full_data_json=event.get("full_data_json"),
+                )
 
         if event_type in {"task_started", "msa_started", "msa_done", "inference_started", "heartbeat", "task_done", "task_error"}:
             _merge_status_file(
@@ -5205,6 +5324,7 @@ def _sync_worker(
     output_dir: Path,
     stop_event: threading.Event,
     interval: float = 5.0,
+    by_target_include_best_full_data: bool = False,
 ) -> None:
     state = _load_sync_state(output_dir, run_id)
     applied_ids = set(str(x) for x in state.get("applied_ids", []))
@@ -5235,6 +5355,7 @@ def _sync_worker(
                     output_root=output_dir,
                     dict_key=f"{base_key}:reconstructed",
                     event=reconstructed,
+                    by_target_include_best_full_data=by_target_include_best_full_data,
                 )
                 _track_stream_watermark(state, reconstructed)
             except Exception as exc:  # noqa: BLE001
@@ -5296,6 +5417,7 @@ def _sync_worker(
                         output_root=output_dir,
                         dict_key=key,
                         event=payload,
+                        by_target_include_best_full_data=by_target_include_best_full_data,
                     )
                     _track_stream_watermark(state, payload)
                 elif event_type == "chunk":
@@ -5333,6 +5455,7 @@ def _sync_worker(
                                 output_root=output_dir,
                                 dict_key=f"{base_key}:reconstructed",
                                 event=reconstructed,
+                                by_target_include_best_full_data=by_target_include_best_full_data,
                             )
                             _track_stream_watermark(state, reconstructed)
                         except Exception as exc:  # noqa: BLE001
@@ -5351,6 +5474,7 @@ def _sync_worker(
                         output_root=output_dir,
                         dict_key=key,
                         event=payload,
+                        by_target_include_best_full_data=by_target_include_best_full_data,
                     )
                     _track_stream_watermark(state, payload)
             else:
@@ -5359,7 +5483,11 @@ def _sync_worker(
                     ack_keys.append(key)
                     changed = True
                     continue
-                _save_task_result(output_dir, payload)
+                _save_task_result(
+                    output_dir,
+                    payload,
+                    by_target_include_best_full_data=by_target_include_best_full_data,
+                )
                 _mark_result_applied(state, payload)
             applied_ids.add(key)
             ack_keys.append(key)
@@ -5426,6 +5554,7 @@ def _warn_fixed_msa_compatibility(
 def run_pipeline(
     pair_csv: str,
     output_dir: str = "./results_protenix",
+    by_target_include_best_full_data: bool = False,
     csv_limit: int = 0,
     # Binder/target MSA controls
     binder_mode: str = "de_novo",  # de_novo | fixed_msa | full_msa
@@ -5511,6 +5640,7 @@ def run_pipeline(
 
     include_antitarget = _coerce_bool(include_antitarget)
     include_self = _coerce_bool(include_self)
+    by_target_include_best_full_data = _coerce_bool(by_target_include_best_full_data)
     mmseqs_store_fetched_msas = _coerce_bool(mmseqs_store_fetched_msas)
     stream_logs = _coerce_bool(stream_logs)
     retry_errors = _coerce_bool(retry_errors)
@@ -5909,6 +6039,7 @@ def run_pipeline(
     _log(f"GPU: {gpu}")
     _log(f"Max parallel: {max_parallel}")
     _log(f"Inference max batch size: {inference_max_batch_size} (fill_window_s={inference_batch_fill_window_s})")
+    _log(f"By-target best full_data export: {bool(by_target_include_best_full_data)}")
     _log(f"Resume mode: {resume_n} (retry_errors={retry_errors})")
     _log(f"Output dir: {output_root}")
     _log(f"Streaming: ENABLED (run_id={effective_run_id})")
@@ -5920,6 +6051,13 @@ def run_pipeline(
 
     configured_fn = GPU_FUNCTIONS[gpu]
     configured_batch_fn = GPU_FUNCTIONS_BATCH[gpu]
+
+    def save_task_result(payload: Dict[str, Any]) -> None:
+        _save_task_result(
+            output_root,
+            payload,
+            by_target_include_best_full_data=by_target_include_best_full_data,
+        )
 
     def existing_result_for(task: Dict[str, Any], default_status: str) -> Dict[str, Any]:
         pair_id = task["pair_id"]
@@ -5973,7 +6111,20 @@ def run_pipeline(
         exec_state = str(prev.get("exec_state", "pending"))
         req_ok = all(p.exists() for p in _required_success_files(output_root, pair_id, role))
         if exec_state == "success" and req_ok and not overwrite_existing:
-            results.append(existing_result_for(task, "success"))
+            existing = existing_result_for(task, "success")
+            results.append(existing)
+            _export_by_target_selected_artifacts(
+                output_root,
+                pair_id=pair_id,
+                role=role,
+                best_cif_text=existing.get("best_cif"),
+                include_best_full_data=by_target_include_best_full_data,
+                best_seed=existing.get("best_seed"),
+                best_sample_rank=existing.get("best_sample_rank"),
+                binder_name=existing.get("binder_name"),
+                target_name=existing.get("target_name"),
+                row_index=existing.get("row_index"),
+            )
             continue
 
         if exec_state == "error" and not retry_errors:
@@ -6051,7 +6202,13 @@ def run_pipeline(
     stop_sync = threading.Event()
     sync_thread = threading.Thread(
         target=_sync_worker,
-        args=(effective_run_id, output_root, stop_sync, sync_interval),
+        args=(
+            effective_run_id,
+            output_root,
+            stop_sync,
+            sync_interval,
+            by_target_include_best_full_data,
+        ),
         daemon=True,
     )
     sync_thread.start()
@@ -6306,7 +6463,7 @@ def run_pipeline(
             task = task_lookup[tid]
             res = make_error_result(task, reason)
             results.append(res)
-            _save_task_result(output_root, res)
+            save_task_result(res)
             pending_ids.remove(tid)
             n += 1
         return n
@@ -6333,7 +6490,7 @@ def run_pipeline(
                     res = make_error_result(task, f"MSA dependency failed ({dep_key}): {err}")
                     results.append(res)
                     pending_ids.remove(tid)
-                    _save_task_result(output_root, res)
+                    save_task_result(res)
                     last_progress_at = time.time()
                     _log(f"[MSA-ERROR] {tid} -> {err[:120]}")
                     continue
@@ -6544,7 +6701,7 @@ def run_pipeline(
                                 _log(f"[{len(results)}/{len(task_list)}] ✓ {tid} ipTM={res.get('best_iptm', -1):.4f}")
                             else:
                                 _log(f"[{len(results)}/{len(task_list)}] ✗ {tid} {str(res.get('error','error'))[:120]}")
-                            _save_task_result(output_root, res)
+                            save_task_result(res)
                     else:
                         tid = str(tid_or_batch)
                         started_at.pop(tid, None)
@@ -6577,7 +6734,7 @@ def run_pipeline(
                             _log(f"[{len(results)}/{len(task_list)}] ✓ {tid} ipTM={res.get('best_iptm', -1):.4f}")
                         else:
                             _log(f"[{len(results)}/{len(task_list)}] ✗ {tid} {str(res.get('error','error'))[:120]}")
-                        _save_task_result(output_root, res)
+                        save_task_result(res)
             else:
                 if pending_ids and not ready_q and (resolver_thread is None or not resolver_thread.is_alive()):
                     terminalize_pending("Task remained blocked after MSA resolver completed")
@@ -6639,7 +6796,7 @@ def run_pipeline(
                 "Task missing terminal result; synthesized by scheduler invariant check",
             )
             result_by_task_id[tid] = synthesized
-            _save_task_result(output_root, synthesized)
+            save_task_result(synthesized)
 
     results = [result_by_task_id[t["task_id"]] for t in task_list if t["task_id"] in result_by_task_id]
     csv_path = _write_summary_csv(output_root, results)
@@ -6715,6 +6872,7 @@ def run_pipeline(
         "stream_logs": bool(stream_logs),
         "log_chunk_seconds": float(log_chunk_seconds),
         "heartbeat_seconds": float(heartbeat_seconds),
+        "by_target_include_best_full_data": bool(by_target_include_best_full_data),
     }
     _atomic_save_json(meta_path, metadata)
 
