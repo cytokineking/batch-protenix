@@ -1055,6 +1055,8 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
 
     pair_summary = load_pair_summary(pair_summary_path)
+    if "partner_role" in pair_summary.columns:
+        pair_summary = pair_summary.loc[pair_summary["partner_role"].astype(str) == "target"].copy()
     successful = pair_summary.loc[pair_summary["status"].astype(str) == "success"].copy()
     if successful.empty:
         raise ValueError("No successful complexes found in pair_summary.csv")

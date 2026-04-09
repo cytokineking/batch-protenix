@@ -26,6 +26,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -39,6 +40,8 @@ from urllib.parse import urlparse
 
 import modal
 
+from pair_csv_utils import load_input_csv as _load_input_csv_shared
+from pair_csv_utils import looks_like_header as _looks_like_header_shared
 from vhh_msa_templates import (
     analyze_vhh_sequence,
     build_assignment_rows,
@@ -184,6 +187,7 @@ image = (
         f"cd /root/MMseqs2 && git checkout {shlex.quote(MMSEQS2_GIT_REF)}",
     )
     .add_local_file("ipsae.py", "/root/ipsae.py", copy=True)
+    .add_local_file("pair_csv_utils.py", "/root/pair_csv_utils.py", copy=True)
     .add_local_file("vhh_msa_templates.py", "/root/vhh_msa_templates.py", copy=True)
 )
 
@@ -445,6 +449,18 @@ def _build_cache_key(
         ]
     )
     return _short_hash(payload, n=32)
+
+
+def _cache_lookup_roles(role: str) -> List[str]:
+    requested = str(role or "").strip()
+    candidates = [requested]
+    if requested == "partner":
+        candidates.append("target")
+    seen: List[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            seen.append(candidate)
+    return seen
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -841,11 +857,22 @@ def _msa_dependency_key(role: str, sequence: str, context_hash: str) -> str:
     return f"msa:{role}:{seq_hash}:{context_hash}"
 
 
+def _partner_requires_target_like_msa(partner_role: Any) -> bool:
+    return str(partner_role or "").strip().lower() in {"target", "decoy"}
+
+
+def _partner_slot_value(payload: Dict[str, Any]) -> str:
+    slot = str(payload.get("partner_slot") or "").strip()
+    if slot:
+        return slot
+    return str(payload.get("partner_role") or "target").strip() or "target"
+
+
 def _parse_task_id(task_id: str) -> Tuple[str, str]:
     if "__" not in task_id:
         return task_id, "target"
-    pair_id, role = task_id.rsplit("__", 1)
-    return pair_id, role
+    pair_id, slot = task_id.rsplit("__", 1)
+    return pair_id, slot
 
 
 def _required_success_files(output_root: Path, pair_id: str, role: str) -> List[Path]:
@@ -878,7 +905,9 @@ def _manifest_hash(task_rows: Sequence[Dict[str, Any]], critical_flags: Dict[str
                 "task_id": r["task_id"],
                 "pair_id": r["pair_id"],
                 "row_index": r["row_index"],
+                "comparison_group_id": r.get("comparison_group_id"),
                 "partner_role": r["partner_role"],
+                "partner_slot": _partner_slot_value(r),
                 "partner_name": r["partner_name"],
                 "partner_seq": _normalize_sequence(str(r.get("partner_seq", ""))),
                 "binder_name": r["binder_name"],
@@ -899,43 +928,11 @@ def _manifest_hash(task_rows: Sequence[Dict[str, Any]], critical_flags: Dict[str
 # =============================================================================
 
 def _looks_like_header(row: Sequence[str]) -> bool:
-    s = " ".join(x.strip().lower() for x in row if x is not None)
-    return (
-        "binder" in s
-        and ("target" in s or "antigen" in s)
-        and "seq" in s
-    )
+    return _looks_like_header_shared(row)
 
 
 def _load_pair_rows(pair_csv: Path) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    with open(pair_csv, newline="", encoding="utf-8-sig") as f:
-        reader = csv.reader(f)
-        raw = list(reader)
-
-    if not raw:
-        return rows
-
-    start = 1 if _looks_like_header(raw[0]) else 0
-    for idx, row in enumerate(raw[start:], start=start):
-        if not row:
-            continue
-        cols = list(row) + [""] * max(0, 4 - len(row))
-        binder_name, binder_seq, target_name, target_seq = [c.strip() for c in cols[:4]]
-        if not (binder_name and binder_seq and target_name and target_seq):
-            continue
-        bseq = _normalize_sequence(binder_seq)
-        tseq = _normalize_sequence(target_seq)
-        rows.append(
-            {
-                "row_index": idx,
-                "binder_name": _sanitize_name(binder_name),
-                "binder_seq": bseq,
-                "target_name": _sanitize_name(target_name),
-                "target_seq": tseq,
-            }
-        )
-    return rows
+    return list((_load_input_csv_shared(pair_csv).get("pair_rows") or []))
 
 
 def _read_msa_pair(
@@ -1393,6 +1390,95 @@ def _legacy_cache_entry_valid(
         return False
 
 
+def _cached_msa_hit_for_roles(
+    *,
+    sequence: str,
+    requested_role: str,
+    host_url: str,
+    msa_mode: str,
+    pairing_strategy: str,
+    db_tag: str,
+    context_hash: str,
+    context_meta: Optional[Dict[str, Any]],
+    require_complete_marker: bool,
+    expected_msa_modes: Sequence[str],
+) -> Optional[Dict[str, Any]]:
+    cache_context_meta = dict(context_meta or {})
+    for cache_role in _cache_lookup_roles(requested_role):
+        cache_key = _build_cache_key(
+            sequence=sequence,
+            role=cache_role,
+            host_url=host_url,
+            msa_mode=msa_mode,
+            pairing_strategy=pairing_strategy,
+            db_tag=db_tag,
+            context_hash=context_hash,
+        )
+        cache_dir = MSA_CACHE_ROOT / cache_key
+        if not _cache_entry_valid(
+            cache_dir,
+            require_complete_marker=require_complete_marker,
+            context_meta=cache_context_meta if cache_context_meta else None,
+            expected_msa_modes=expected_msa_modes,
+        ):
+            continue
+        result = {
+            "status": "cached",
+            "cache_key": cache_key,
+            "cache_dir": str(cache_dir),
+            "require_complete_marker": bool(require_complete_marker),
+        }
+        if cache_role != str(requested_role):
+            result["cache_role_alias"] = cache_role
+        return result
+    return None
+
+
+def _legacy_cached_msa_hit_for_roles(
+    *,
+    sequence: str,
+    requested_role: str,
+    host_url: str,
+    msa_mode: str,
+    pairing_strategy: str,
+    db_tag: str,
+) -> Optional[Dict[str, Any]]:
+    for cache_role in _cache_lookup_roles(requested_role):
+        legacy_cache_key = _build_cache_key(
+            sequence=sequence,
+            role=cache_role,
+            host_url=host_url,
+            msa_mode=msa_mode,
+            pairing_strategy=pairing_strategy,
+            db_tag=db_tag,
+            context_hash="",
+        )
+        legacy_dir = MSA_CACHE_ROOT / legacy_cache_key
+        if not legacy_dir.exists():
+            continue
+        if not _legacy_cache_entry_valid(
+            legacy_dir,
+            sequence=sequence,
+            role=cache_role,
+            host_url=host_url,
+            msa_mode=msa_mode,
+            pairing_strategy=pairing_strategy,
+            db_tag=db_tag,
+        ):
+            continue
+        result = {
+            "status": "cached",
+            "cache_key": legacy_cache_key,
+            "cache_dir": str(legacy_dir),
+            "require_complete_marker": False,
+            "legacy_cache_key": True,
+        }
+        if cache_role != str(requested_role):
+            result["cache_role_alias"] = cache_role
+        return result
+    return None
+
+
 def _write_cache_entry(
     cache_dir: Path,
     pairing: Optional[str],
@@ -1459,80 +1545,48 @@ def _lookup_cached_msa_entry(
     fallback_n = (fallback_mode or "none").strip().lower()
     cache_context_meta = dict(context_meta or {})
 
-    cache_key = _build_cache_key(
+    cached = _cached_msa_hit_for_roles(
         sequence=sequence,
-        role=role,
+        requested_role=role,
         host_url=host_url,
         msa_mode=mode_n,
         pairing_strategy=pairing_strategy,
         db_tag=db_tag,
         context_hash=context_hash,
-    )
-    cache_dir = MSA_CACHE_ROOT / cache_key
-    if _cache_entry_valid(
-        cache_dir,
+        context_meta=cache_context_meta,
         require_complete_marker=require_complete_marker,
-        context_meta=cache_context_meta if cache_context_meta else None,
         expected_msa_modes=[mode_n],
-    ):
-        return {
-            "status": "cached",
-            "cache_key": cache_key,
-            "cache_dir": str(cache_dir),
-            "require_complete_marker": bool(require_complete_marker),
-        }
+    )
+    if cached is not None:
+        return cached
 
     if mode_n == "local_gpu" and fallback_n == "colabfold":
-        fallback_cache_key = _build_cache_key(
+        fallback_cached = _cached_msa_hit_for_roles(
             sequence=sequence,
-            role=role,
+            requested_role=role,
             host_url=host_url,
             msa_mode="colabfold_fallback",
             pairing_strategy=pairing_strategy,
             db_tag=db_tag,
             context_hash=context_hash,
-        )
-        fallback_cache_dir = MSA_CACHE_ROOT / fallback_cache_key
-        if _cache_entry_valid(
-            fallback_cache_dir,
+            context_meta=cache_context_meta,
             require_complete_marker=require_complete_marker,
-            context_meta=cache_context_meta if cache_context_meta else None,
             expected_msa_modes=["colabfold_fallback"],
-        ):
-            return {
-                "status": "cached",
-                "cache_key": fallback_cache_key,
-                "cache_dir": str(fallback_cache_dir),
-                "require_complete_marker": bool(require_complete_marker),
-                "fallback": "colabfold",
-            }
+        )
+        if fallback_cached is not None:
+            fallback_cached["fallback"] = "colabfold"
+            return fallback_cached
 
-    legacy_cache_key = _build_cache_key(
+    legacy_cached = _legacy_cached_msa_hit_for_roles(
         sequence=sequence,
-        role=role,
+        requested_role=role,
         host_url=host_url,
         msa_mode=mode_n,
         pairing_strategy=pairing_strategy,
         db_tag=db_tag,
-        context_hash="",
     )
-    legacy_dir = MSA_CACHE_ROOT / legacy_cache_key
-    if legacy_dir.exists() and _legacy_cache_entry_valid(
-        legacy_dir,
-        sequence=sequence,
-        role=role,
-        host_url=host_url,
-        msa_mode=mode_n,
-        pairing_strategy=pairing_strategy,
-        db_tag=db_tag,
-    ):
-        return {
-            "status": "cached",
-            "cache_key": legacy_cache_key,
-            "cache_dir": str(legacy_dir),
-            "require_complete_marker": False,
-            "legacy_cache_key": True,
-        }
+    if legacy_cached is not None:
+        return legacy_cached
     return None
 
 
@@ -1710,66 +1764,51 @@ def _get_or_fetch_cached_msa(
         fallback_cache_dir = MSA_CACHE_ROOT / fallback_cache_key
 
     cache_context_meta = dict(context_meta or {})
-    if read_cache and _cache_entry_valid(
-        cache_dir,
-        require_complete_marker=require_complete_marker,
-        context_meta=cache_context_meta if cache_context_meta else None,
-        expected_msa_modes=[mode_n],
-    ):
-        return {
-            "status": "cached",
-            "cache_key": cache_key,
-            "cache_dir": str(cache_dir),
-            "require_complete_marker": bool(require_complete_marker),
-        }
-    if (
-        read_cache
-        and fallback_cache_key
-        and fallback_cache_dir is not None
-        and _cache_entry_valid(
-            fallback_cache_dir,
+    if read_cache:
+        cached = _cached_msa_hit_for_roles(
+            sequence=sequence,
+            requested_role=role,
+            host_url=host_url,
+            msa_mode=mode_n,
+            pairing_strategy=pairing_strategy,
+            db_tag=db_tag,
+            context_hash=context_hash,
+            context_meta=cache_context_meta,
             require_complete_marker=require_complete_marker,
-            context_meta=cache_context_meta if cache_context_meta else None,
+            expected_msa_modes=[mode_n],
+        )
+        if cached is not None:
+            return cached
+    if read_cache and fallback_cache_key and fallback_cache_dir is not None:
+        fallback_cached = _cached_msa_hit_for_roles(
+            sequence=sequence,
+            requested_role=role,
+            host_url=host_url,
+            msa_mode="colabfold_fallback",
+            pairing_strategy=pairing_strategy,
+            db_tag=db_tag,
+            context_hash=context_hash,
+            context_meta=cache_context_meta,
+            require_complete_marker=require_complete_marker,
             expected_msa_modes=["colabfold_fallback"],
         )
-    ):
-        return {
-            "status": "cached",
-            "cache_key": fallback_cache_key,
-            "cache_dir": str(fallback_cache_dir),
-            "require_complete_marker": bool(require_complete_marker),
-            "fallback": "colabfold",
-        }
+        if fallback_cached is not None:
+            fallback_cached["fallback"] = "colabfold"
+            return fallback_cached
 
     # Backwards-compatibility: older cache keys omitted context_hash and some context metadata.
     # If we miss on the canonical key, try the legacy key and validate by sha+mode fields.
     if read_cache:
-        legacy_cache_key = _build_cache_key(
+        legacy_cached = _legacy_cached_msa_hit_for_roles(
             sequence=sequence,
-            role=role,
+            requested_role=role,
             host_url=host_url,
             msa_mode=mode_n,
             pairing_strategy=pairing_strategy,
             db_tag=db_tag,
-            context_hash="",
         )
-        legacy_dir = MSA_CACHE_ROOT / legacy_cache_key
-        if legacy_dir.exists() and _legacy_cache_entry_valid(
-            legacy_dir,
-            sequence=sequence,
-            role=role,
-            host_url=host_url,
-            msa_mode=mode_n,
-            pairing_strategy=pairing_strategy,
-            db_tag=db_tag,
-        ):
-            return {
-                "status": "cached",
-                "cache_key": legacy_cache_key,
-                "cache_dir": str(legacy_dir),
-                "require_complete_marker": False,
-                "legacy_cache_key": True,
-            }
+        if legacy_cached is not None:
+            return legacy_cached
 
     last_err: Optional[Exception] = None
     for attempt in range(max_fetch_attempts):
@@ -1842,24 +1881,22 @@ def _get_or_fetch_cached_msa(
             last_err = exc
             if mode_n == "local_gpu" and fallback_n == "colabfold":
                 # Re-check fallback cache in case another worker populated it while we were running.
-                if (
-                    read_cache
-                    and fallback_cache_key
-                    and fallback_cache_dir is not None
-                    and _cache_entry_valid(
-                        fallback_cache_dir,
+                if read_cache:
+                    fallback_cached = _cached_msa_hit_for_roles(
+                        sequence=sequence,
+                        requested_role=role,
+                        host_url=host_url,
+                        msa_mode="colabfold_fallback",
+                        pairing_strategy=pairing_strategy,
+                        db_tag=db_tag,
+                        context_hash=context_hash,
+                        context_meta=cache_context_meta,
                         require_complete_marker=require_complete_marker,
-                        context_meta=cache_context_meta if cache_context_meta else None,
                         expected_msa_modes=["colabfold_fallback"],
                     )
-                ):
-                    return {
-                        "status": "cached",
-                        "cache_key": fallback_cache_key,
-                        "cache_dir": str(fallback_cache_dir),
-                        "require_complete_marker": bool(require_complete_marker),
-                        "fallback": "colabfold",
-                    }
+                    if fallback_cached is not None:
+                        fallback_cached["fallback"] = "colabfold"
+                        return fallback_cached
                 try:
                     if fallback_hosted_rate_key:
                         _acquire_global_msa_submit_slot(
@@ -3015,8 +3052,11 @@ _PAIR_SUMMARY_HEADER = [
     "task_id",
     "pair_id",
     "row_index",
+    "comparison_group_id",
     "partner_role",
+    "partner_slot",
     "partner_name",
+    "partner_seq",
     "binder_name",
     "binder_seq",
     "target_name",
@@ -3297,8 +3337,11 @@ def _build_pair_summary_row(result: Dict[str, Any]) -> Dict[str, Any]:
             "task_id": result.get("task_id"),
             "pair_id": result.get("pair_id"),
             "row_index": result.get("row_index"),
+            "comparison_group_id": result.get("comparison_group_id"),
             "partner_role": result.get("partner_role"),
+            "partner_slot": result.get("partner_slot"),
             "partner_name": result.get("partner_name"),
+            "partner_seq": result.get("partner_seq"),
             "binder_name": result.get("binder_name"),
             "binder_seq": result.get("binder_seq"),
             "target_name": result.get("target_name"),
@@ -3354,6 +3397,28 @@ def _build_pair_summary_row(result: Dict[str, Any]) -> Dict[str, Any]:
 
     row["ipsae_error"] = _summarize_interface_errors(candidate_summaries, n_candidates=n_candidates)
     return row
+
+
+def _task_result_identity(task: Dict[str, Any], *, default_status: str, default_error: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "status": default_status,
+        "task_id": task["task_id"],
+        "pair_id": task["pair_id"],
+        "row_index": task["row_index"],
+        "comparison_group_id": task.get("comparison_group_id"),
+        "partner_role": task["partner_role"],
+        "partner_slot": _partner_slot_value(task),
+        "partner_name": task["partner_name"],
+        "partner_seq": task["partner_seq"],
+        "binder_name": task["binder_name"],
+        "binder_seq": task["binder_seq"],
+        "target_name": task["target_name"],
+        "target_seq": task["target_seq"],
+        "selection_scope": task["best_sample_scope"],
+        "attempt": int(task.get("attempt", 1)),
+        "lease_epoch": int(task.get("lease_epoch", 0)),
+        "error": default_error,
+    }
 
 
 # =============================================================================
@@ -3849,26 +3914,12 @@ def _run_protenix_task_impl(task: Dict[str, Any]) -> Dict[str, Any]:
     task_id = task["task_id"]
     pair_id = task["pair_id"]
     partner_role = task["partner_role"]
+    partner_slot = _partner_slot_value(task)
     partner_name = task["partner_name"]
     binder_name = task["binder_name"]
     target_name = task["target_name"]
 
-    result: Dict[str, Any] = {
-        "status": "error",
-        "task_id": task_id,
-        "pair_id": pair_id,
-        "row_index": task["row_index"],
-        "partner_role": partner_role,
-        "partner_name": partner_name,
-        "binder_name": binder_name,
-        "target_name": target_name,
-        "binder_seq": task["binder_seq"],
-        "target_seq": task["target_seq"],
-        "selection_scope": task["best_sample_scope"],
-        "attempt": int(task.get("attempt", 1)),
-        "lease_epoch": int(task.get("lease_epoch", 0)),
-        "error": None,
-    }
+    result: Dict[str, Any] = _task_result_identity(task, default_status="error")
 
     run_id = task.get("run_id")
     attempt = int(task.get("attempt", 1))
@@ -3925,6 +3976,7 @@ def _run_protenix_task_impl(task: Dict[str, Any]) -> Dict[str, Any]:
                 "stage": "bootstrap",
                 "pair_id": pair_id,
                 "partner_role": partner_role,
+                "partner_slot": partner_slot,
                 "binder_name": binder_name,
                 "partner_name": partner_name,
             },
@@ -3946,7 +3998,7 @@ def _run_protenix_task_impl(task: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         # If no target MSA is available for target role, hard fail.
-        if partner_role == "target" and not partner_msa.get("non_pairing"):
+        if _partner_requires_target_like_msa(partner_role) and not partner_msa.get("non_pairing"):
             partner_ref = task.get("partner_msa_ref", {}) or {}
             source = str(partner_ref.get("source", "unknown"))
             cache_key = str(partner_ref.get("cache_key", ""))
@@ -3954,7 +4006,7 @@ def _run_protenix_task_impl(task: Dict[str, Any]) -> Dict[str, Any]:
             ctx = f"source={source} {retry_note}"
             if cache_key:
                 ctx += f" cache_key={cache_key}"
-            raise RuntimeError(f"Target MSA is required but missing for this task ({ctx})")
+            raise RuntimeError(f"Target-like partner MSA is required but missing for this task ({ctx})")
 
         sample_name = f"{task_id}_pred"
         input_dir = work_dir / "input"
@@ -4205,22 +4257,7 @@ def _run_protenix_task_batch_impl(tasks: Sequence[Dict[str, Any]]) -> List[Dict[
 
     # Basic per-task result skeleton.
     def _base_result(t: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "status": "error",
-            "task_id": t["task_id"],
-            "pair_id": t["pair_id"],
-            "row_index": t["row_index"],
-            "partner_role": t["partner_role"],
-            "partner_name": t["partner_name"],
-            "binder_name": t["binder_name"],
-            "binder_seq": t["binder_seq"],
-            "target_name": t["target_name"],
-            "target_seq": t["target_seq"],
-            "selection_scope": t["best_sample_scope"],
-            "attempt": int(t.get("attempt", 1)),
-            "lease_epoch": int(t.get("lease_epoch", 0)),
-            "error": None,
-        }
+        return _task_result_identity(t, default_status="error")
 
     results_by_task_id: Dict[str, Dict[str, Any]] = {t["task_id"]: _base_result(t) for t in tasks_list}
 
@@ -4245,8 +4282,8 @@ def _run_protenix_task_batch_impl(tasks: Sequence[Dict[str, Any]]) -> List[Dict[
             try:
                 binder_msa = _load_msa_ref(t["binder_msa_ref"])
                 partner_msa = _load_msa_ref(t["partner_msa_ref"])
-                if str(t.get("partner_role")) == "target" and not partner_msa.get("non_pairing"):
-                    raise RuntimeError("Target MSA is required but missing for this task")
+                if _partner_requires_target_like_msa(t.get("partner_role")) and not partner_msa.get("non_pairing"):
+                    raise RuntimeError("Target-like partner MSA is required but missing for this task")
                 # Stash in the task dict to avoid reloading from cache when building JSON.
                 t["_binder_msa_inline"] = binder_msa
                 t["_partner_msa_inline"] = partner_msa
@@ -4628,10 +4665,18 @@ def _by_target_export_paths(
     *,
     binder_name: Any = None,
     target_name: Any = None,
+    partner_role: Any = None,
+    partner_slot: Any = None,
+    partner_name: Any = None,
+    partner_seq: Any = None,
     row_index: Any = None,
 ) -> Optional[Dict[str, Path]]:
     binder_text = "" if binder_name is None else str(binder_name)
     target_text = "" if target_name is None else str(target_name)
+    partner_role_text = str(partner_role or "").strip().lower()
+    partner_slot_text = str(partner_slot or partner_role or "target").strip() or "target"
+    partner_text = "" if partner_name is None else str(partner_name)
+    partner_seq_text = _normalize_sequence("" if partner_seq is None else str(partner_seq))
     row_value = row_index
     if not binder_text or not target_text or row_value in {None, ""}:
         pair_json = _pair_role_paths(output_root, pair_id, "target")["pair_json"]
@@ -4650,9 +4695,28 @@ def _by_target_export_paths(
 
     binder_slug = _slugify(binder_text)
     target_slug = _slugify(target_text)
-    pair_hash = _short_hash(f"{binder_text}|{target_text}|{row_value}")
-    stem = f"{binder_slug}__vs__{target_slug}__{pair_hash}"
-    grouped_dir = output_root / "by_target" / target_slug
+    if partner_role_text == "target":
+        partner_text = partner_text or target_text
+        partner_seq_text = partner_seq_text or ""
+        pair_hash = _short_hash(f"{binder_text}|{target_text}|{row_value}")
+        stem = f"{binder_slug}__vs__{target_slug}__{pair_hash}"
+        grouped_dir = output_root / "by_target" / target_slug
+    elif partner_role_text == "decoy":
+        if not partner_text:
+            return None
+        partner_slug = _slugify(partner_text)
+        partner_seq_hash = _short_hash(partner_seq_text, n=10) if partner_seq_text else "no_seq"
+        pair_hash = _short_hash(f"{binder_text}|{partner_text}|{partner_seq_text}|{row_value}")
+        stem = f"{binder_slug}__vs__{partner_slug}__{pair_hash}"
+        grouped_dir = (
+            output_root
+            / "by_target"
+            / target_slug
+            / "decoys"
+            / f"{_slugify(partner_slot_text)}__{partner_slug}__{partner_seq_hash}"
+        )
+    else:
+        return None
     return {
         "grouped_dir": grouped_dir,
         "best_cif": grouped_dir / f"{stem}.cif",
@@ -4664,7 +4728,10 @@ def _export_by_target_selected_artifacts(
     output_root: Path,
     *,
     pair_id: str,
-    role: str,
+    partner_role: str,
+    partner_slot: str,
+    partner_name: Any = None,
+    partner_seq: Any = None,
     best_cif_text: Any = None,
     include_best_full_data: bool = False,
     best_full_data_json: Optional[Dict[str, Any]] = None,
@@ -4674,7 +4741,9 @@ def _export_by_target_selected_artifacts(
     target_name: Any = None,
     row_index: Any = None,
 ) -> None:
-    if role != "target":
+    partner_role_text = str(partner_role or "").strip().lower()
+    partner_slot_text = str(partner_slot or partner_role or "target").strip() or "target"
+    if partner_role_text not in {"target", "decoy"}:
         return
 
     export_paths = _by_target_export_paths(
@@ -4682,6 +4751,10 @@ def _export_by_target_selected_artifacts(
         pair_id,
         binder_name=binder_name,
         target_name=target_name,
+        partner_role=partner_role_text,
+        partner_slot=partner_slot_text,
+        partner_name=partner_name,
+        partner_seq=partner_seq,
         row_index=row_index,
     )
     if export_paths is None:
@@ -4704,7 +4777,7 @@ def _export_by_target_selected_artifacts(
         return
 
     candidate_full_data = (
-        _pair_role_paths(output_root, pair_id, role)["candidates_dir"]
+        _pair_role_paths(output_root, pair_id, partner_slot_text)["candidates_dir"]
         / f"s{int(seed_value)}_n{int(rank_value)}.full_data.json"
     )
     if candidate_full_data.exists():
@@ -4730,26 +4803,28 @@ def _save_task_result(
     by_target_include_best_full_data: bool = False,
 ) -> None:
     pair_id = str(result["pair_id"])
-    role = str(result["partner_role"])
+    slot = _partner_slot_value(result)
+    partner_role = str(result.get("partner_role", ""))
     attempt = int(result.get("attempt", 1))
     lease_epoch = int(result.get("lease_epoch", 0))
-    current_attempt, current_epoch = _authoritative_epoch(output_root, pair_id, role)
+    current_attempt, current_epoch = _authoritative_epoch(output_root, pair_id, slot)
     stale_epoch = (attempt < current_attempt) or (
         attempt == current_attempt and lease_epoch < current_epoch
     )
     if stale_epoch:
         _log(
-            f"[RESULT] skipping stale result write pair={pair_id} role={role} "
+            f"[RESULT] skipping stale result write pair={pair_id} slot={slot} "
             f"attempt={attempt} lease_epoch={lease_epoch} "
             f"current_attempt={current_attempt} current_lease_epoch={current_epoch}"
         )
         return
-    p = _pair_role_paths(output_root, pair_id, role)
+    p = _pair_role_paths(output_root, pair_id, slot)
     p["pair_dir"].mkdir(parents=True, exist_ok=True)
 
     pair_payload = {
         "pair_id": pair_id,
         "row_index": result.get("row_index"),
+        "comparison_group_id": result.get("comparison_group_id"),
         "binder_name": result.get("binder_name"),
         "binder_seq": result.get("binder_seq"),
         "target_name": result.get("target_name"),
@@ -4763,7 +4838,9 @@ def _save_task_result(
     status_payload = {
         "task_id": result.get("task_id"),
         "pair_id": pair_id,
-        "role": role,
+        "role": slot,
+        "partner_role": partner_role,
+        "partner_slot": slot,
         "scheduler_state": "done",
         "exec_state": "success" if result.get("status") == "success" else "error",
         "stage": "complete" if result.get("status") == "success" else "error",
@@ -4806,7 +4883,10 @@ def _save_task_result(
     _export_by_target_selected_artifacts(
         output_root,
         pair_id=pair_id,
-        role=role,
+        partner_role=partner_role,
+        partner_slot=slot,
+        partner_name=result.get("partner_name"),
+        partner_seq=result.get("partner_seq"),
         best_cif_text=result.get("best_cif"),
         include_best_full_data=by_target_include_best_full_data,
         best_full_data_json=result.get("best_full_data_json") or raw_best_selected.get("full_data_json"),
@@ -4877,6 +4957,57 @@ def _write_dict_rows_csv(
         for row in rows:
             writer.writerow({name: row.get(name, "") for name in header})
     return path
+
+
+def _run_automatic_target_decoy_analysis(pair_summary_path: Path, output_root: Path) -> Dict[str, Any]:
+    analyses_dir = output_root / "analyses"
+    script_path = Path(__file__).resolve().parent / "scripts" / "auto_target_decoy_analysis.py"
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--pair-summary",
+        str(pair_summary_path),
+        "--output-dir",
+        str(analyses_dir),
+    ]
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "analysis_status": "error",
+            "output_dir": str(analyses_dir.resolve()),
+            "error": f"Failed to launch automatic analysis helper: {exc}",
+        }
+
+    if completed.stdout.strip():
+        _log("[AUTO-ANALYSIS] stdout:\n" + completed.stdout.strip())
+    if completed.stderr.strip():
+        _log("[AUTO-ANALYSIS] stderr:\n" + completed.stderr.strip())
+
+    summary_path = analyses_dir / "analysis_summary.json"
+    summary: Dict[str, Any] = {
+        "analysis_status": "error" if completed.returncode else "unknown",
+        "output_dir": str(analyses_dir.resolve()),
+    }
+    if summary_path.exists():
+        try:
+            loaded = _load_json(summary_path)
+            if isinstance(loaded, dict):
+                summary.update(loaded)
+        except Exception as exc:  # noqa: BLE001
+            summary["error"] = f"Automatic analysis wrote unreadable summary: {exc}"
+    if completed.returncode != 0:
+        summary["analysis_status"] = "error"
+        summary["error"] = (
+            f"Automatic analysis helper exited with code {completed.returncode}: "
+            f"{completed.stderr.strip() or completed.stdout.strip()}"
+        )
+    return summary
 
 
 def _effective_msa_mode_from_fetch_info(requested_mode: str, info: Dict[str, Any]) -> str:
@@ -5066,14 +5197,15 @@ def _save_stream_event(
     by_target_include_best_full_data: bool = False,
 ) -> None:
     task_id = str(event.get("task_id", "unknown_task"))
-    pair_id, role = _parse_task_id(task_id)
+    pair_id, slot = _parse_task_id(task_id)
+    partner_role = str(event.get("partner_role", slot))
     attempt = int(event.get("attempt", 0))
     lease_epoch = int(event.get("lease_epoch", 0))
     event_type = str(event.get("event_type", ""))
-    p = _pair_role_paths(output_root, pair_id, role)
+    p = _pair_role_paths(output_root, pair_id, slot)
     p["pair_dir"].mkdir(parents=True, exist_ok=True)
 
-    current_attempt, current_epoch = _authoritative_epoch(output_root, pair_id, role)
+    current_attempt, current_epoch = _authoritative_epoch(output_root, pair_id, slot)
     stale_epoch = (attempt < current_attempt) or (
         attempt == current_attempt and lease_epoch < current_epoch
     )
@@ -5114,11 +5246,14 @@ def _save_stream_event(
             if isinstance(event.get("summary_confidence_json"), dict):
                 _atomic_save_json(p["best_summary"], _to_jsonable(event["summary_confidence_json"]))
                 artifact_paths.append(str(p["best_summary"].relative_to(output_root)))
-            if role == "target":
+            if slot == "target":
                 _export_by_target_selected_artifacts(
                     output_root,
                     pair_id=pair_id,
-                    role=role,
+                    partner_role=partner_role,
+                    partner_slot=slot,
+                    partner_name=event.get("partner_name"),
+                    partner_seq=event.get("partner_seq"),
                     best_cif_text=event.get("cif_text"),
                     include_best_full_data=by_target_include_best_full_data,
                     best_full_data_json=event.get("full_data_json"),
@@ -5130,7 +5265,9 @@ def _save_stream_event(
                 {
                     "task_id": task_id,
                     "pair_id": pair_id,
-                    "role": role,
+                    "role": slot,
+                    "partner_role": partner_role,
+                    "partner_slot": slot,
                     "attempt": attempt,
                     "lease_epoch": lease_epoch,
                     "stage": event.get("stage"),
@@ -5776,19 +5913,28 @@ def run_pipeline(
             }
         )
 
-    pair_rows = _load_pair_rows(Path(pair_csv))
+    input_info = _load_input_csv_shared(Path(pair_csv))
+    source_rows = list(input_info.get("source_rows") or [])
+    pair_rows = list(input_info.get("pair_rows") or [])
     if not pair_rows:
         raise ValueError("No valid rows found in pair CSV")
     if csv_limit > 0:
-        original_n = len(pair_rows)
-        pair_rows = pair_rows[:csv_limit]
-        _log(f"[WARN] --csv-limit={csv_limit} enabled: limiting rows {original_n} -> {len(pair_rows)}")
+        original_n = len(source_rows)
+        source_rows = source_rows[:csv_limit]
+        allowed_groups = {str(row["comparison_group_id"]) for row in source_rows}
+        pair_rows = [row for row in pair_rows if str(row.get("comparison_group_id")) in allowed_groups]
+        _log(f"[WARN] --csv-limit={csv_limit} enabled: limiting rows {original_n} -> {len(source_rows)}")
 
-    for r in pair_rows:
-        if not _sequence_is_protein_like(r["binder_seq"]):
-            print(f"[WARN] Binder sequence for row {r['row_index']} contains non-standard characters")
-        if not _sequence_is_protein_like(r["target_seq"]):
-            print(f"[WARN] Target sequence for row {r['row_index']} contains non-standard characters")
+    for row in source_rows:
+        if not _sequence_is_protein_like(row["binder_seq"]):
+            print(f"[WARN] Binder sequence for row {row['row_index']} contains non-standard characters")
+    for row in pair_rows:
+        if not _sequence_is_protein_like(row["partner_seq"]):
+            print(
+                "[WARN] Partner sequence for "
+                f"row {row['row_index']} slot {row.get('partner_slot', row.get('partner_role'))} "
+                "contains non-standard characters"
+            )
 
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -5801,7 +5947,7 @@ def run_pipeline(
         fixed_binder_msa = _read_msa_pair(msa_dir=Path(binder_fixed_msa_dir))
         if not fixed_binder_msa.get("non_pairing"):
             raise ValueError("Fixed binder MSA must provide non_pairing.a3m")
-        for row in pair_rows:
+        for row in source_rows:
             _warn_fixed_msa_compatibility(
                 fixed_msa=fixed_binder_msa,
                 binder_seq=row["binder_seq"],
@@ -5868,13 +6014,13 @@ def run_pipeline(
             }, None
         return None, dep_for("binder", seq)
 
-    def target_source(name: str, seq: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    def structured_partner_source(name: str, seq: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         if target_msa_source_n == "provided":
             pair = _target_msa_lookup(target_msa_map, name, seq)
             if not pair or not pair.get("non_pairing"):
-                raise RuntimeError(f"No provided target MSA found for target '{name}'")
+                raise RuntimeError(f"No provided target-like partner MSA found for partner '{name}'")
             return {"source": "inline", "pairing": pair.get("pairing"), "non_pairing": pair.get("non_pairing")}, None
-        return None, dep_for("target", seq)
+        return None, dep_for("partner", seq)
 
     def antitarget_source() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         if antitarget_msa_source_n == "none":
@@ -5887,10 +6033,13 @@ def run_pipeline(
             }, None
         return None, dep_for("antitarget", antitarget_seq)
 
+    pair_rows_by_group: Dict[str, List[Dict[str, Any]]] = {}
+    for pair_row in pair_rows:
+        pair_rows_by_group.setdefault(str(pair_row["comparison_group_id"]), []).append(pair_row)
+
     task_list: List[Dict[str, Any]] = []
-    for row in pair_rows:
+    for row in source_rows:
         binder_static, binder_dep = binder_source(row["binder_seq"])
-        target_static, target_dep = target_source(row["target_name"], row["target_seq"])
 
         base_hash = _short_hash(f"{row['binder_name']}|{row['target_name']}|{row['row_index']}")
         pair_id = (
@@ -5900,19 +6049,22 @@ def run_pipeline(
 
         def add_task(
             role: str,
+            slot: str,
             partner_name: str,
             partner_seq: str,
             partner_static: Optional[Dict[str, Any]],
             partner_dep: Optional[str],
         ) -> None:
-            task_id = f"{pair_id}__{role}"
+            task_id = f"{pair_id}__{slot}"
             deps = [x for x in [binder_dep, partner_dep] if x]
             task_list.append(
                 {
                     "task_id": task_id,
                     "pair_id": pair_id,
                     "row_index": row["row_index"],
+                    "comparison_group_id": row["comparison_group_id"],
                     "partner_role": role,
+                    "partner_slot": slot,
                     "partner_name": _sanitize_name(partner_name),
                     "partner_seq": _normalize_sequence(partner_seq),
                     "binder_name": row["binder_name"],
@@ -5947,14 +6099,34 @@ def run_pipeline(
                 }
             )
 
-        add_task("target", row["target_name"], row["target_seq"], target_static, target_dep)
+        group_rows = sorted(
+            pair_rows_by_group.get(str(row["comparison_group_id"]), []),
+            key=lambda rec: (0 if str(rec.get("partner_slot")) == "target" else 1, str(rec.get("partner_slot", ""))),
+        )
+        if not group_rows:
+            raise RuntimeError(
+                f"No canonical partner rows were found for comparison_group_id={row['comparison_group_id']}"
+            )
+        for main_partner in group_rows:
+            partner_static, partner_dep = structured_partner_source(
+                str(main_partner["partner_name"]),
+                str(main_partner["partner_seq"]),
+            )
+            add_task(
+                str(main_partner["partner_role"]),
+                str(main_partner["partner_slot"]),
+                str(main_partner["partner_name"]),
+                str(main_partner["partner_seq"]),
+                partner_static,
+                partner_dep,
+            )
 
         if include_antitarget:
             anti_static, anti_dep = antitarget_source()
-            add_task("antitarget", antitarget_name, antitarget_seq, anti_static, anti_dep)
+            add_task("antitarget", "antitarget", antitarget_name, antitarget_seq, anti_static, anti_dep)
 
         if include_self:
-            add_task("self", row["binder_name"], row["binder_seq"], {"source": "none"}, None)
+            add_task("self", "self", row["binder_name"], row["binder_seq"], {"source": "none"}, None)
 
     meta_path = output_root / "run_metadata.json"
     prior_meta: Optional[Dict[str, Any]] = None
@@ -6012,7 +6184,9 @@ def run_pipeline(
     _log("\n" + "=" * 78)
     _log("PROTENIX + ipSAE PIPELINE (Modal)")
     _log("=" * 78)
-    _log(f"Pair rows: {len(pair_rows)}")
+    _log(f"Input mode: {input_info.get('input_mode', 'legacy_pair')}")
+    _log(f"Pair rows: {len(source_rows)}")
+    _log(f"Canonical partner rows: {len(pair_rows)}")
     _log(f"Tasks: {len(task_list)}")
     _log(f"MSA deps: {len(dep_requests)} unique")
     _log(f"Binder mode: {binder_mode_n}")
@@ -6061,29 +6235,23 @@ def run_pipeline(
 
     def existing_result_for(task: Dict[str, Any], default_status: str) -> Dict[str, Any]:
         pair_id = task["pair_id"]
-        role = task["partner_role"]
-        metrics_path = _pair_role_paths(output_root, pair_id, role)["metrics"]
+        slot = _partner_slot_value(task)
+        metrics_path = _pair_role_paths(output_root, pair_id, slot)["metrics"]
         if metrics_path.exists():
             try:
                 out = _load_json(metrics_path)
                 out["status"] = out.get("status", default_status)
+                out.setdefault("comparison_group_id", task.get("comparison_group_id"))
+                out.setdefault("partner_slot", slot)
+                out.setdefault("partner_seq", task.get("partner_seq"))
                 return out
             except Exception:  # noqa: BLE001
                 pass
-        return {
-            "status": default_status,
-            "task_id": task["task_id"],
-            "pair_id": task["pair_id"],
-            "row_index": task["row_index"],
-            "partner_role": task["partner_role"],
-            "partner_name": task["partner_name"],
-            "binder_name": task["binder_name"],
-            "binder_seq": task["binder_seq"],
-            "target_name": task["target_name"],
-            "target_seq": task["target_seq"],
-            "selection_scope": task["best_sample_scope"],
-            "error": None if default_status == "success" else "skipped",
-        }
+        return _task_result_identity(
+            task,
+            default_status=default_status,
+            default_error=None if default_status == "success" else "skipped",
+        )
 
     def parse_iso_ts(value: Any) -> float:
         if not isinstance(value, str) or not value:
@@ -6100,8 +6268,9 @@ def run_pipeline(
 
     for task in task_list:
         pair_id = task["pair_id"]
-        role = task["partner_role"]
-        status_path = _task_status_path(output_root, pair_id, role)
+        slot = _partner_slot_value(task)
+        partner_role = str(task["partner_role"])
+        status_path = _task_status_path(output_root, pair_id, slot)
         prev = _load_task_status(status_path)
 
         if resume_n == "never" or overwrite_existing or prev is None:
@@ -6109,14 +6278,17 @@ def run_pipeline(
             continue
 
         exec_state = str(prev.get("exec_state", "pending"))
-        req_ok = all(p.exists() for p in _required_success_files(output_root, pair_id, role))
+        req_ok = all(p.exists() for p in _required_success_files(output_root, pair_id, slot))
         if exec_state == "success" and req_ok and not overwrite_existing:
             existing = existing_result_for(task, "success")
             results.append(existing)
             _export_by_target_selected_artifacts(
                 output_root,
                 pair_id=pair_id,
-                role=role,
+                partner_role=partner_role,
+                partner_slot=slot,
+                partner_name=existing.get("partner_name"),
+                partner_seq=existing.get("partner_seq"),
                 best_cif_text=existing.get("best_cif"),
                 include_best_full_data=by_target_include_best_full_data,
                 best_seed=existing.get("best_seed"),
@@ -6141,20 +6313,13 @@ def run_pipeline(
                 # Avoid duplicate execution while another active scheduler still holds this task.
                 results.append(
                     {
-                        "status": "running_elsewhere",
-                        "task_id": task["task_id"],
-                        "pair_id": task["pair_id"],
-                        "row_index": task["row_index"],
-                        "partner_role": task["partner_role"],
-                        "partner_name": task["partner_name"],
-                        "binder_name": task["binder_name"],
-                        "binder_seq": task["binder_seq"],
-                        "target_name": task["target_name"],
-                        "target_seq": task["target_seq"],
-                        "selection_scope": task["best_sample_scope"],
+                        **_task_result_identity(
+                            task,
+                            default_status="running_elsewhere",
+                            default_error="Task appears active in another run; skipped reschedule (resume=auto).",
+                        ),
                         "attempt": int(prev.get("attempt", 1)),
                         "lease_epoch": int(prev.get("lease_epoch", 0)),
-                        "error": "Task appears active in another run; skipped reschedule (resume=auto).",
                     }
                 )
                 continue
@@ -6168,13 +6333,15 @@ def run_pipeline(
         task["scheduler_state"] = "blocked_msa" if deps else "ready"
         for dkey in deps:
             dep_waiters.setdefault(dkey, set()).add(task["task_id"])
-        p = _pair_role_paths(output_root, task["pair_id"], task["partner_role"])
+        slot = _partner_slot_value(task)
+        p = _pair_role_paths(output_root, task["pair_id"], slot)
         p["pair_dir"].mkdir(parents=True, exist_ok=True)
         _atomic_save_json(
             p["pair_json"],
             {
                 "pair_id": task["pair_id"],
                 "row_index": task["row_index"],
+                "comparison_group_id": task.get("comparison_group_id"),
                 "binder_name": task["binder_name"],
                 "binder_seq": task["binder_seq"],
                 "target_name": task["target_name"],
@@ -6186,7 +6353,9 @@ def run_pipeline(
             {
                 "task_id": task["task_id"],
                 "pair_id": task["pair_id"],
-                "role": task["partner_role"],
+                "role": slot,
+                "partner_role": task["partner_role"],
+                "partner_slot": slot,
                 "scheduler_state": task["scheduler_state"],
                 "exec_state": "pending",
                 "attempt": int(task["attempt"]),
@@ -6381,22 +6550,7 @@ def run_pipeline(
         try:
             return configured_fn.remote(t)
         except Exception as exc:  # noqa: BLE001
-            return {
-                "status": "error",
-                "task_id": t["task_id"],
-                "pair_id": t["pair_id"],
-                "row_index": t["row_index"],
-                "partner_role": t["partner_role"],
-                "partner_name": t["partner_name"],
-                "binder_name": t["binder_name"],
-                "binder_seq": t["binder_seq"],
-                "target_name": t["target_name"],
-                "target_seq": t["target_seq"],
-                "selection_scope": t["best_sample_scope"],
-                "attempt": int(t.get("attempt", 1)),
-                "lease_epoch": int(t.get("lease_epoch", 0)),
-                "error": str(exc),
-            }
+            return _task_result_identity(t, default_status="error", default_error=str(exc))
 
     def run_safe_batch(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         try:
@@ -6409,24 +6563,7 @@ def run_pipeline(
             err = str(exc)
             failed: List[Dict[str, Any]] = []
             for t in batch:
-                failed.append(
-                    {
-                        "status": "error",
-                        "task_id": t.get("task_id"),
-                        "pair_id": t.get("pair_id"),
-                        "row_index": t.get("row_index"),
-                        "partner_role": t.get("partner_role"),
-                        "partner_name": t.get("partner_name"),
-                        "binder_name": t.get("binder_name"),
-                        "binder_seq": t.get("binder_seq"),
-                        "target_name": t.get("target_name"),
-                        "target_seq": t.get("target_seq"),
-                        "selection_scope": t.get("best_sample_scope"),
-                        "attempt": int(t.get("attempt", 1)),
-                        "lease_epoch": int(t.get("lease_epoch", 0)),
-                        "error": err,
-                    }
-                )
+                failed.append(_task_result_identity(t, default_status="error", default_error=err))
             return failed
 
     _log(f"Scheduling {len(runnable)} runnable task(s) with dependency-gated MSA resolver...")
@@ -6440,22 +6577,7 @@ def run_pipeline(
     all_task_lookup: Dict[str, Dict[str, Any]] = {t["task_id"]: t for t in task_list}
 
     def make_error_result(task: Dict[str, Any], error_msg: str) -> Dict[str, Any]:
-        return {
-            "status": "error",
-            "task_id": task["task_id"],
-            "pair_id": task["pair_id"],
-            "row_index": task["row_index"],
-            "partner_role": task["partner_role"],
-            "partner_name": task["partner_name"],
-            "binder_name": task["binder_name"],
-            "binder_seq": task["binder_seq"],
-            "target_name": task["target_name"],
-            "target_seq": task["target_seq"],
-            "selection_scope": task["best_sample_scope"],
-            "attempt": int(task.get("attempt", 1)),
-            "lease_epoch": int(task.get("lease_epoch", 0)),
-            "error": str(error_msg),
-        }
+        return _task_result_identity(task, default_status="error", default_error=str(error_msg))
 
     def terminalize_pending(reason: str) -> int:
         n = 0
@@ -6500,7 +6622,7 @@ def run_pipeline(
                     ready_q.append(tid)
                     last_progress_at = time.time()
                     _merge_status_file(
-                        _task_status_path(output_root, task["pair_id"], task["partner_role"]),
+                        _task_status_path(output_root, task["pair_id"], _partner_slot_value(task)),
                         {"scheduler_state": "ready", "exec_state": "pending", "stage": "ready"},
                     )
 
@@ -6517,7 +6639,7 @@ def run_pipeline(
                     lease_exp = now + lease_timeout_s
                     task["lease_expires_at"] = lease_exp
                     _merge_status_file(
-                        _task_status_path(output_root, task["pair_id"], task["partner_role"]),
+                        _task_status_path(output_root, task["pair_id"], _partner_slot_value(task)),
                         {"lease_expires_at": lease_exp, "exec_state": "running", "scheduler_state": "leased"},
                     )
                     started_at[tid] = now
@@ -6603,7 +6725,7 @@ def run_pipeline(
 
                     started_at[tid] = time.time()
                     _merge_status_file(
-                        _task_status_path(output_root, task["pair_id"], task["partner_role"]),
+                        _task_status_path(output_root, task["pair_id"], _partner_slot_value(task)),
                         {
                             "scheduler_state": "leased",
                             "exec_state": "running",
@@ -6638,7 +6760,7 @@ def run_pipeline(
                             task["lease_expires_at"] = None
                             ready_q.appendleft(tid)
                             _merge_status_file(
-                                _task_status_path(output_root, task["pair_id"], task["partner_role"]),
+                                _task_status_path(output_root, task["pair_id"], _partner_slot_value(task)),
                                 {"scheduler_state": "ready", "exec_state": "pending", "stage": "ready"},
                             )
                         payloads = payloads[:remaining]
@@ -6668,24 +6790,9 @@ def run_pipeline(
                             res_list = []
                             for tid in tids:
                                 task = task_lookup[tid]
-                                res_list.append(
-                                    {
-                                        "status": "error",
-                                        "task_id": tid,
-                                        "pair_id": task["pair_id"],
-                                        "row_index": task["row_index"],
-                                        "partner_role": task["partner_role"],
-                                        "partner_name": task["partner_name"],
-                                        "binder_name": task["binder_name"],
-                                        "binder_seq": task["binder_seq"],
-                                        "target_name": task["target_name"],
-                                        "target_seq": task["target_seq"],
-                                        "selection_scope": task["best_sample_scope"],
-                                        "attempt": int(task.get("attempt", 1)),
-                                        "lease_epoch": int(task.get("lease_epoch", 1)),
-                                        "error": str(exc),
-                                    }
-                                )
+                                res = _task_result_identity(task, default_status="error", default_error=str(exc))
+                                res["lease_epoch"] = int(task.get("lease_epoch", 1))
+                                res_list.append(res)
                         res_by_tid = {str(r.get("task_id", "")): r for r in (res_list or []) if isinstance(r, dict)}
                         for tid in tids:
                             task = task_lookup[tid]
@@ -6709,22 +6816,8 @@ def run_pipeline(
                         try:
                             res = fut.result()
                         except Exception as exc:  # noqa: BLE001
-                            res = {
-                                "status": "error",
-                                "task_id": tid,
-                                "pair_id": task["pair_id"],
-                                "row_index": task["row_index"],
-                                "partner_role": task["partner_role"],
-                                "partner_name": task["partner_name"],
-                                "binder_name": task["binder_name"],
-                                "binder_seq": task["binder_seq"],
-                                "target_name": task["target_name"],
-                                "target_seq": task["target_seq"],
-                                "selection_scope": task["best_sample_scope"],
-                                "attempt": int(task.get("attempt", 1)),
-                                "lease_epoch": int(task.get("lease_epoch", 1)),
-                                "error": str(exc),
-                            }
+                            res = _task_result_identity(task, default_status="error", default_error=str(exc))
+                            res["lease_epoch"] = int(task.get("lease_epoch", 1))
                         results.append(res)
                         pending_ids.discard(tid)
                         task["scheduler_state"] = "done"
@@ -6800,6 +6893,12 @@ def run_pipeline(
 
     results = [result_by_task_id[t["task_id"]] for t in task_list if t["task_id"] in result_by_task_id]
     csv_path = _write_summary_csv(output_root, results)
+    auto_analysis: Dict[str, Any] = {
+        "analysis_status": "not_requested",
+        "output_dir": str((output_root / "analyses").resolve()),
+    }
+    if any(str(task.get("partner_role")) == "decoy" for task in task_list):
+        auto_analysis = _run_automatic_target_decoy_analysis(csv_path, output_root)
 
     n_success = sum(1 for r in results if r.get("status") == "success")
     n_running_elsewhere = sum(1 for r in results if r.get("status") == "running_elsewhere")
@@ -6810,11 +6909,15 @@ def run_pipeline(
         run_status = "complete_with_errors"
     else:
         run_status = "complete_success"
+    if run_status == "complete_success" and str(auto_analysis.get("analysis_status")) in {"error", "complete_with_errors"}:
+        run_status = "complete_with_errors"
     metadata = {
         "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
         "run_id": effective_run_id,
         "pair_csv": str(pair_csv),
-        "num_rows": len(pair_rows),
+        "input_mode": str(input_info.get("input_mode", "legacy_pair")),
+        "num_rows": len(source_rows),
+        "num_canonical_partner_rows": len(pair_rows),
         "num_tasks_total": len(task_list),
         "num_tasks_started": int(n_started),
         "num_tasks_dispatched": int(tasks_dispatched),
@@ -6822,6 +6925,7 @@ def run_pipeline(
         "num_tasks_unique_returned": len(result_by_task_id),
         "num_tasks_running_elsewhere": int(n_running_elsewhere),
         "run_status": run_status,
+        "automatic_analysis": auto_analysis,
         "task_manifest_hash": task_manifest_hash,
         "resume_mode": resume_n,
         "resume_manifest_override": bool(resume_manifest_override),
@@ -6885,6 +6989,11 @@ def run_pipeline(
     print(f"Failed : {n_fail}/{len(results)}")
     print(f"Summary CSV: {csv_path}")
     print(f"Run metadata: {meta_path}")
+    print(
+        "Automatic analysis: "
+        f"{auto_analysis.get('analysis_status', 'not_requested')} "
+        f"({auto_analysis.get('output_dir', output_root / 'analyses')})"
+    )
 
 
 @app.local_entrypoint()
@@ -6941,13 +7050,13 @@ def smoke_local_mmseqs(
         expected_db_tag=mmseqs_db_tag,
         expected_db_profile=db_profile_n,
     )
-    rows = _load_pair_rows(Path(pair_csv))
+    rows = list((_load_input_csv_shared(Path(pair_csv)).get("pair_rows") or []))
     if not rows:
         raise ValueError(f"No valid rows found in {pair_csv}")
     seqs: List[str] = []
     seen: set[str] = set()
     for row in rows:
-        for s in (row["target_seq"], row["binder_seq"]):
+        for s in (row["partner_seq"], row["binder_seq"]):
             sn = _normalize_sequence(s)
             if sn and sn not in seen:
                 seen.add(sn)

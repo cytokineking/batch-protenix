@@ -96,14 +96,12 @@ to share a single MSA template representative.
 
 ## Required Input CSV
 
-`--pair-csv` should contain one pair per row (header optional). The first 4 columns are used:
+`--pair-csv` supports three input modes:
 
-1. binder name
-2. binder sequence
-3. target name
-4. target sequence
+1. Legacy headerless positional CSV: the first 4 columns are interpreted as binder name, binder sequence, target name, and target sequence. Rows missing any of these four fields are skipped.
+2. Headered canonical CSV: exact headers `binder_name,binder_sequence,target_name,target_sequence`. This mode is strict: missing required values, malformed rows, or unknown extra headers fail fast.
+3. Headered wide CSV: canonical binder/target columns plus optional decoy slots such as `decoy_name,decoy_sequence`, `decoy2_name,decoy2_sequence`, `decoy3_name,decoy3_sequence`, and so on. This mode is also strict and rejects malformed decoy slots or unknown extra headers.
 
-Rows missing any of these four fields are skipped.
 If no valid rows remain, the run fails fast.
 
 Single-protein predictions:
@@ -117,6 +115,13 @@ Example:
 binder_name,binder_sequence,target_name,target_sequence
 b1,EVQLVESGGGLVQPGGSLRLSCAAS...,targetA,MKAILVVLLYTFATANAD...
 b2,DIQMTQSPSSLSASVGDRVTITCR...,targetB,MSPQTETKASVGFKAGVKEY...
+```
+
+Wide CSV example:
+
+```csv
+binder_name,binder_sequence,target_name,target_sequence,decoy_name,decoy_sequence,decoy2_name,decoy2_sequence
+b1,EVQLVESGGGLVQPGGSLRLSCAAS...,targetA,MKAILVVLLYTFATANAD...,offA,MSPQTETKASVGFKAGVKEY...,offB,MNNIRRVAILAALV...
 ```
 
 ## Quick Start
@@ -316,7 +321,8 @@ ready tasks into a single Protenix invocation to amortize model load.
 - `--max-parallel <int>` (default: `1`)
   - Max concurrent inference task executions.
 - `--by-target-include-best-full-data <bool>` (default: `false`)
-  - When enabled, exports the selected top-sample `full_data.json` next to the selected `.cif` in `by_target/<target>/`.
+  - When enabled, exports the selected top-sample `full_data.json` next to the selected `.cif` in `by_target/`.
+  - Wide target+decoy runs keep on-target exports under `by_target/<target>/` and place decoy exports under `by_target/<target>/decoys/<slot>__<decoy>__<seqhash>/`.
 - Streaming is always enabled for this pipeline.
 - `--stream-logs <bool>` (default: `true`)
 - `--log-chunk-seconds <float>` (default: `1.0`)
@@ -546,12 +552,17 @@ Helpful flags:
     <target_slug>/
       <binder_slug>__vs__<target_slug>__<short_hash>.cif
       <binder_slug>__vs__<target_slug>__<short_hash>.full_data.json  # optional; when enabled
+      decoys/
+        <slot>__<decoy_slug>__<decoy_seq_hash>/
+          <binder_slug>__vs__<decoy_slug>__<short_hash>.cif
+          <binder_slug>__vs__<decoy_slug>__<short_hash>.full_data.json  # optional; when enabled
 ```
 
 `pair_summary.csv` columns:
 
 - `task_id`, `pair_id`, `row_index`
-- `partner_role`, `partner_name`
+- `comparison_group_id`
+- `partner_role`, `partner_slot`, `partner_name`, `partner_seq`
 - `binder_name`, `binder_seq`
 - `target_name`, `target_seq`
 - `status`
@@ -576,6 +587,8 @@ Count semantics:
 Interface metric note:
 
 - `pDockQ`, `pDockQ2`, and `LIS` are prediction-derived interface metrics from `ipsae.py`, not true `DockQ`.
+
+Wide target/decoy runs also emit automatic analyses under `analyses/`, including one pairwise comparison per successful decoy and a per-target aggregate summary for multi-decoy runs.
 
 ## Notes
 

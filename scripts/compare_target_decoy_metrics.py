@@ -196,15 +196,18 @@ def plot_histogram_overlay(
     plt.close(fig)
 
 
-def main() -> None:
-    args = parse_args()
-    on_csv = Path(args.on_csv)
-    off_csv = Path(args.off_csv)
-    output_dir = Path(args.output_dir)
+def run_comparison(
+    *,
+    on_csv: Path,
+    off_csv: Path,
+    output_dir: Path,
+    on_label: str = "On-target",
+    off_label: str = "Off-target",
+) -> Dict[str, object]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    on_df, on_status = load_pair_summary(on_csv, "on")
-    off_df, off_status = load_pair_summary(off_csv, "off")
+    on_df, on_status = load_pair_summary(Path(on_csv), "on")
+    off_df, off_status = load_pair_summary(Path(off_csv), "off")
 
     merged = on_df.merge(off_df, on=["binder_name", "binder_seq"], how="inner", validate="one_to_one")
     if merged.empty:
@@ -239,8 +242,8 @@ def main() -> None:
         "inputs": {
             "on_csv": str(on_csv.resolve()),
             "off_csv": str(off_csv.resolve()),
-            "on_label": args.on_label,
-            "off_label": args.off_label,
+            "on_label": on_label,
+            "off_label": off_label,
         },
         "status_counts": {
             "on": on_status,
@@ -262,8 +265,8 @@ def main() -> None:
         on_col="iptm_mean_on",
         off_col="iptm_mean_off",
         metric_label="Mean ipTM",
-        on_label=args.on_label,
-        off_label=args.off_label,
+        on_label=on_label,
+        off_label=off_label,
         out_path=output_dir / "mean_iptm_scatter.png",
     )
     plot_scatter(
@@ -271,8 +274,8 @@ def main() -> None:
         on_col="ipsae_mean_on",
         off_col="ipsae_mean_off",
         metric_label="Mean ipSAE",
-        on_label=args.on_label,
-        off_label=args.off_label,
+        on_label=on_label,
+        off_label=off_label,
         out_path=output_dir / "mean_ipsae_scatter.png",
     )
     plot_violin_strip(
@@ -280,8 +283,8 @@ def main() -> None:
         on_col="iptm_mean_on",
         off_col="iptm_mean_off",
         metric_label="Mean ipTM",
-        on_label=args.on_label,
-        off_label=args.off_label,
+        on_label=on_label,
+        off_label=off_label,
         out_path=output_dir / "mean_iptm_violin_strip.png",
     )
     plot_violin_strip(
@@ -289,8 +292,8 @@ def main() -> None:
         on_col="ipsae_mean_on",
         off_col="ipsae_mean_off",
         metric_label="Mean ipSAE",
-        on_label=args.on_label,
-        off_label=args.off_label,
+        on_label=on_label,
+        off_label=off_label,
         out_path=output_dir / "mean_ipsae_violin_strip.png",
     )
     plot_histogram_overlay(
@@ -298,8 +301,8 @@ def main() -> None:
         on_col="iptm_mean_on",
         off_col="iptm_mean_off",
         metric_label="Mean ipTM",
-        on_label=args.on_label,
-        off_label=args.off_label,
+        on_label=on_label,
+        off_label=off_label,
         out_path=output_dir / "mean_iptm_histogram.png",
     )
     plot_histogram_overlay(
@@ -307,9 +310,21 @@ def main() -> None:
         on_col="ipsae_mean_on",
         off_col="ipsae_mean_off",
         metric_label="Mean ipSAE",
+        on_label=on_label,
+        off_label=off_label,
+        out_path=output_dir / "mean_ipsae_histogram.png",
+    )
+    return summary
+
+
+def main() -> None:
+    args = parse_args()
+    run_comparison(
+        on_csv=Path(args.on_csv),
+        off_csv=Path(args.off_csv),
+        output_dir=Path(args.output_dir),
         on_label=args.on_label,
         off_label=args.off_label,
-        out_path=output_dir / "mean_ipsae_histogram.png",
     )
 
 

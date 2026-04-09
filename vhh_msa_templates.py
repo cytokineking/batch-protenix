@@ -18,6 +18,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from pair_csv_utils import load_input_csv as _load_input_csv_shared
+from pair_csv_utils import looks_like_header as _looks_like_header_shared
+
 
 def normalize_sequence(seq: str) -> str:
     return re.sub(r"\s+", "", seq or "").upper()
@@ -601,38 +604,11 @@ def segmentation_to_dict(segmentation: VhhSegmentation) -> Dict[str, Any]:
 
 
 def _looks_like_header(row: Sequence[str]) -> bool:
-    lowered = [str(col or "").strip().lower() for col in row[:4]]
-    header_tokens = {"binder_name", "binder", "binder_seq", "binder_sequence", "target_name", "target", "target_seq", "target_sequence"}
-    return any(token in header_tokens for token in lowered)
+    return _looks_like_header_shared(row)
 
 
 def load_pair_rows(pair_csv: Path) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    with open(pair_csv, newline="", encoding="utf-8-sig") as f:
-        reader = csv.reader(f)
-        raw = list(reader)
-
-    if not raw:
-        return rows
-
-    start = 1 if _looks_like_header(raw[0]) else 0
-    for idx, row in enumerate(raw[start:], start=start):
-        if not row:
-            continue
-        cols = list(row) + [""] * max(0, 4 - len(row))
-        binder_name, binder_seq, target_name, target_seq = [str(col or "").strip() for col in cols[:4]]
-        if not (binder_name and binder_seq and target_name and target_seq):
-            continue
-        rows.append(
-            {
-                "row_index": idx,
-                "binder_name": binder_name,
-                "binder_seq": normalize_sequence(binder_seq),
-                "target_name": target_name,
-                "target_seq": normalize_sequence(target_seq),
-            }
-        )
-    return rows
+    return list((_load_input_csv_shared(pair_csv).get("source_rows") or []))
 
 
 def _write_csv(path: Path, rows: Sequence[Dict[str, Any]], preferred: Optional[Sequence[str]] = None) -> None:
