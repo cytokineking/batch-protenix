@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Modal deployment for Protenix v1 + ipSAE batch pipeline.
+Modal deployment for a Protenix + ipSAE batch pipeline.
 
 This pipeline is row-centric:
 - Input CSV rows are treated as independent binder/target pairs.
@@ -136,10 +136,21 @@ MMSEQS_TMP_ROOT = Path("/mmseqs_tmp")
 MMSEQS_DB_MANIFEST = MMSEQS_DB_ROOT / "db_manifest.json"
 MMSEQS_BOOTSTRAP_STATE_KEY = "mmseqs_bootstrap:state"
 
-PROTENIX_GIT_URL = os.environ.get("PROTENIX_GIT_URL", "https://github.com/bytedance/Protenix.git")
-PROTENIX_GIT_REF = os.environ.get("PROTENIX_GIT_REF", "4b5c7fadb2eac2f7d70546a97998ccd9d9d4d8b7")
+PROTENIX_GIT_URL = os.environ.get(
+    "PROTENIX_GIT_URL", "https://github.com/cytokineking/Protenix.git"
+)
+PROTENIX_GIT_REF = os.environ.get(
+    "PROTENIX_GIT_REF", "8c93234e0b53cc1ceeecb3fb8cd9d58fb7803d78"
+)
 MMSEQS2_GIT_URL = os.environ.get("MMSEQS2_GIT_URL", "https://github.com/soedinglab/MMseqs2.git")
 MMSEQS2_GIT_REF = os.environ.get("MMSEQS2_GIT_REF", "01683a607f83878e95436632d73e1d7d9ae30955")
+PROTENIX_CHECKPOINT_MIRRORS = {
+    "protenix-v2": {
+        "url": "https://huggingface.co/TMF001/pxdesign-weights/resolve/main/checkpoint/protenix-v2.pt",
+        "sha256": "8f931f9774a396b67033d0e58628e1834f4a1448165e04254b40a780b0c0d599",
+        "source": "Hugging Face TMF001/pxdesign-weights mirror",
+    },
+}
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -1048,19 +1059,62 @@ def _load_single_name_sequence_csv(path: Path, label: str) -> Tuple[str, str]:
 # PROTENIX BOOTSTRAP
 # =============================================================================
 
-def _download_with_retry(url: str, out_path: Path, retries: int = 4) -> None:
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _download_with_retry(
+    url: str,
+    out_path: Path,
+    retries: int = 4,
+    expected_sha256: Optional[str] = None,
+) -> None:
     import urllib.request
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     last_err: Optional[Exception] = None
     for i in range(retries):
+        tmp_path = out_path.with_name(f".{out_path.name}.download-{uuid.uuid4().hex}.tmp")
         try:
-            urllib.request.urlretrieve(url, str(out_path))
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "batch-protenix/1.0"},
+            )
+            with urllib.request.urlopen(req) as response, tmp_path.open("wb") as fh:
+                shutil.copyfileobj(response, fh, length=1024 * 1024)
+            if expected_sha256:
+                actual_sha256 = _sha256_file(tmp_path)
+                if actual_sha256.lower() != expected_sha256.lower():
+                    raise RuntimeError(
+                        f"SHA256 mismatch for {url}: expected {expected_sha256}, got {actual_sha256}"
+                    )
+            tmp_path.replace(out_path)
             return
         except Exception as exc:  # noqa: BLE001
             last_err = exc
+            tmp_path.unlink(missing_ok=True)
             time.sleep(min(30, 2 ** i))
     raise RuntimeError(f"Failed to download {url}: {last_err}")
+
+
+def _resolve_checkpoint_download(
+    model_name: str,
+    upstream_url: str,
+    checkpoint_url_override: Optional[str] = None,
+) -> Tuple[str, Optional[str], str]:
+    override_url = str(checkpoint_url_override or "").strip()
+    if override_url:
+        return override_url, None, "explicit override"
+
+    mirror = PROTENIX_CHECKPOINT_MIRRORS.get(model_name)
+    if mirror:
+        return str(mirror["url"]), str(mirror["sha256"]), str(mirror["source"])
+
+    return str(upstream_url).strip(), None, "upstream Protenix URL"
 
 
 def _checkpoint_is_valid(path: Path) -> bool:
@@ -1082,7 +1136,11 @@ def _checkpoint_file_present(path: Path) -> bool:
     return bool(path.exists() and path.stat().st_size >= 100 * 1024 * 1024)
 
 
-def _ensure_protenix_runtime(model_name: str, populate_missing: bool = False) -> None:
+def _ensure_protenix_runtime(
+    model_name: str,
+    populate_missing: bool = False,
+    checkpoint_url_override: Optional[str] = None,
+) -> None:
     """
     Validate runtime files for inference, or populate them during explicit init.
 
@@ -1109,11 +1167,24 @@ def _ensure_protenix_runtime(model_name: str, populate_missing: bool = False) ->
         if model_name not in URL:
             raise ValueError(f"Unknown Protenix model: {model_name}")
 
+        checkpoint_url, checkpoint_sha256, checkpoint_source = _resolve_checkpoint_download(
+            model_name=model_name,
+            upstream_url=str(URL[model_name]).strip(),
+            checkpoint_url_override=checkpoint_url_override,
+        )
+
         if not _checkpoint_is_valid(checkpoint_path):
             if checkpoint_path.exists():
                 checkpoint_path.unlink(missing_ok=True)
-            print(f"Downloading checkpoint for {model_name}...")
-            _download_with_retry(URL[model_name], checkpoint_path)
+            print(
+                f"Downloading checkpoint for {model_name} from {checkpoint_url} "
+                f"({checkpoint_source})..."
+            )
+            _download_with_retry(
+                checkpoint_url,
+                checkpoint_path,
+                expected_sha256=checkpoint_sha256,
+            )
             if not _checkpoint_is_valid(checkpoint_path):
                 raise RuntimeError(f"Checkpoint validation failed for {checkpoint_path}")
 
@@ -5727,7 +5798,7 @@ def run_pipeline(
     mmseqs_local_commit_every_n: int = 1,
     mmseqs_local_commit_interval_s: float = 30.0,
     # Inference controls
-    model_name: str = "protenix_base_default_v1.0.0",
+    model_name: str = "protenix-v2",
     seeds: str = "101",
     sample_diffusion_n_sample: int = 5,
     sample_diffusion_n_step: int = 200,
@@ -6997,9 +7068,14 @@ def run_pipeline(
 
 
 @app.local_entrypoint()
-def init_protenix_runtime(model_name: str = "protenix_base_default_v1.0.0"):
+def init_protenix_runtime(
+    model_name: str = "protenix-v2",
+    checkpoint_url_override: Optional[str] = None,
+):
     print(f"Initializing Protenix runtime cache for model: {model_name}")
-    msg = _init_runtime_remote.remote(model_name)
+    if checkpoint_url_override:
+        print(f"Using checkpoint override URL: {checkpoint_url_override}")
+    msg = _init_runtime_remote.remote(model_name, checkpoint_url_override)
     print(msg)
 
 
@@ -7707,8 +7783,12 @@ def prepare_vhh_binder_msas(
     timeout=3600,
     volumes={str(RUNTIME_ROOT): runtime_volume},
 )
-def _init_runtime_remote(model_name: str) -> str:
-    _ensure_protenix_runtime(model_name, populate_missing=True)
+def _init_runtime_remote(model_name: str, checkpoint_url_override: Optional[str] = None) -> str:
+    _ensure_protenix_runtime(
+        model_name,
+        populate_missing=True,
+        checkpoint_url_override=checkpoint_url_override,
+    )
     files = list(RUNTIME_ROOT.rglob("*"))
     total_size = sum(p.stat().st_size for p in files if p.is_file())
     return (

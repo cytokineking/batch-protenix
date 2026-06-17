@@ -1,7 +1,8 @@
 # Protenix Modal Batch Pipeline
 
 This repository provides a production-style Modal pipeline for large batch binder-target
-screening with Protenix v1, plus ipSAE post-scoring for interface quality analysis.
+screening with Protenix, defaulting to Protenix v2 and supporting explicit v1 opt-in,
+plus ipSAE post-scoring for interface quality analysis.
 
 It is designed for long-running, restartable batch jobs where you want:
 
@@ -53,6 +54,16 @@ Optional override env vars for image source refs:
 
 - `PROTENIX_GIT_URL`, `PROTENIX_GIT_REF`
 - `MMSEQS2_GIT_URL`, `MMSEQS2_GIT_REF`
+
+By default, the Modal image now bootstraps the v2-capable `cytokineking/Protenix`
+fork at commit `8c93234e0b53cc1ceeecb3fb8cd9d58fb7803d78`. Override
+`PROTENIX_GIT_URL` and `PROTENIX_GIT_REF` only if you want a different Protenix
+checkout.
+
+The `protenix-v2` checkpoint is downloaded from the Hugging Face
+`TMF001/pxdesign-weights` mirror by default because the upstream ByteDance
+checkpoint URL can return `403 Forbidden` outside China. Other Protenix
+checkpoint names still use the URLs from the pinned Protenix checkout.
 
 ## Main Command
 
@@ -132,7 +143,19 @@ Populate checkpoint + required common runtime artifacts on Modal Volume:
 
 ```bash
 modal run modal_protenix_batch.py::init_protenix_runtime \
-  --model-name protenix_base_default_v1.0.0
+  --model-name protenix-v2
+```
+
+If you are reusing an existing Modal volume that was previously initialized for v1,
+rerun `init_protenix_runtime` with `--model-name protenix-v2` before your first v2 run
+so the `protenix-v2.pt` checkpoint is present.
+
+For one-off testing with a different checkpoint source, pass an explicit URL:
+
+```bash
+modal run modal_protenix_batch.py::init_protenix_runtime \
+  --model-name protenix-v2 \
+  --checkpoint-url-override https://huggingface.co/TMF001/pxdesign-weights/resolve/main/checkpoint/protenix-v2.pt
 ```
 
 `run_pipeline` now uses validate-only runtime checks and will fail fast if these files are missing.
@@ -291,7 +314,8 @@ Scratch-space behavior:
 
 ### Inference controls
 
-- `--model-name <name>` (default: `protenix_base_default_v1.0.0`)
+- `--model-name <name>` (default: `protenix-v2`; pass `protenix_base_default_v1.0.0` to opt into v1)
+- `protenix-v2` in the pinned fork currently hard-fails when `N_token > 2560`; for larger complexes, explicitly use `--model-name protenix_base_default_v1.0.0`
 - `--seeds <csv>` (default: `101`, example: `101,102`)
 - `--sample-diffusion-n-sample <int>` (default: `5`)
 - `--sample-diffusion-n-step <int>` (default: `200`)
@@ -380,8 +404,12 @@ Inference workers do not auto-download these files.
 
 ```bash
 modal run modal_protenix_batch.py::init_protenix_runtime \
-  --model-name protenix_base_default_v1.0.0
+  --model-name protenix-v2
 ```
+
+For `protenix-v2`, this uses the Hugging Face `TMF001/pxdesign-weights`
+checkpoint mirror and validates the pinned SHA256 before committing the runtime
+volume.
 
 ### Initialize local MMseqs UniRef100 DB
 
