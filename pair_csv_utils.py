@@ -14,17 +14,30 @@ CANONICAL_PAIR_HEADERS: Tuple[str, ...] = (
     "target_sequence",
 )
 _CANONICAL_HEADER_SET = set(CANONICAL_PAIR_HEADERS)
+OPTIONAL_TEMPLATE_HEADERS: Tuple[str, ...] = (
+    "binder_template_path",
+    "binder_template_chain_id",
+    "target_template_path",
+    "target_template_chain_id",
+)
+_OPTIONAL_TEMPLATE_HEADER_SET = set(OPTIONAL_TEMPLATE_HEADERS)
 _HEADER_ALIAS_TOKENS = {
     "binder",
     "binder_name",
     "binder_seq",
     "binder_sequence",
+    "binder_template_path",
+    "binder_template_chain_id",
     "target",
     "target_name",
     "target_seq",
     "target_sequence",
+    "target_template_path",
+    "target_template_chain_id",
 }
-_DECOY_HEADER_RE = re.compile(r"^decoy(?:(?P<index>[2-9][0-9]*))?_(?P<kind>name|sequence)$")
+_DECOY_HEADER_RE = re.compile(
+    r"^decoy(?:(?P<index>[2-9][0-9]*))?_(?P<kind>name|sequence|template_path|template_chain_id)$"
+)
 
 
 def sanitize_name(name: str) -> str:
@@ -105,8 +118,11 @@ def _raise_header_error(message: str) -> None:
     guidance = (
         "Headered pair CSVs must use exactly:\n"
         "  binder_name,binder_sequence,target_name,target_sequence\n\n"
+        "Template-enabled pair CSVs may additionally use:\n"
+        "  binder_template_path,binder_template_chain_id,target_template_path,target_template_chain_id\n\n"
         "Wide target+decoy CSVs may additionally use:\n"
-        "  decoy_name,decoy_sequence,decoy2_name,decoy2_sequence,..."
+        "  decoy_name,decoy_sequence,decoy_template_path,decoy_template_chain_id,\n"
+        "  decoy2_name,decoy2_sequence,decoy2_template_path,decoy2_template_chain_id,..."
     )
     raise ValueError(f"{message}\n\n{guidance}")
 
@@ -122,6 +138,10 @@ def _build_source_row(row_index: int, row_map: Dict[str, str]) -> Dict[str, Any]
         "binder_seq": binder_seq,
         "target_name": target_name,
         "target_seq": target_seq,
+        "binder_template_path": str(row_map.get("binder_template_path", "") or "").strip(),
+        "binder_template_chain_id": str(row_map.get("binder_template_chain_id", "") or "").strip(),
+        "target_template_path": str(row_map.get("target_template_path", "") or "").strip(),
+        "target_template_chain_id": str(row_map.get("target_template_chain_id", "") or "").strip(),
         "comparison_group_id": _comparison_group_id(
             int(row_index),
             binder_name,
@@ -139,6 +159,8 @@ def _pair_row_from_source(
     partner_slot: str,
     partner_name: str,
     partner_seq: str,
+    partner_template_path: str = "",
+    partner_template_chain_id: str = "",
 ) -> Dict[str, Any]:
     return {
         "row_index": int(source_row["row_index"]),
@@ -151,6 +173,10 @@ def _pair_row_from_source(
         "binder_seq": str(source_row["binder_seq"]),
         "target_name": str(source_row["target_name"]),
         "target_seq": str(source_row["target_seq"]),
+        "binder_template_path": str(source_row.get("binder_template_path", "") or "").strip(),
+        "binder_template_chain_id": str(source_row.get("binder_template_chain_id", "") or "").strip(),
+        "partner_template_path": str(partner_template_path or "").strip(),
+        "partner_template_chain_id": str(partner_template_chain_id or "").strip(),
     }
 
 
@@ -170,6 +196,10 @@ def _load_legacy_pair_rows(raw: Sequence[Sequence[str]]) -> Dict[str, Any]:
             "binder_seq": normalize_sequence(binder_seq),
             "target_name": sanitize_name(target_name),
             "target_seq": normalize_sequence(target_seq),
+            "binder_template_path": "",
+            "binder_template_chain_id": "",
+            "target_template_path": "",
+            "target_template_chain_id": "",
             "comparison_group_id": _comparison_group_id(
                 int(row_index),
                 binder_name,
@@ -186,6 +216,8 @@ def _load_legacy_pair_rows(raw: Sequence[Sequence[str]]) -> Dict[str, Any]:
                 partner_slot="target",
                 partner_name=source_row["target_name"],
                 partner_seq=source_row["target_seq"],
+                partner_template_path="",
+                partner_template_chain_id="",
             )
         )
     return {
@@ -214,7 +246,7 @@ def _parse_header_mode(raw: Sequence[Sequence[str]]) -> Dict[str, Any]:
     unknown_headers: List[str] = []
     malformed_decoy_headers: List[str] = []
     for header_raw, header in zip(headers_raw, headers):
-        if header in _CANONICAL_HEADER_SET:
+        if header in _CANONICAL_HEADER_SET or header in _OPTIONAL_TEMPLATE_HEADER_SET:
             continue
         match = _DECOY_HEADER_RE.match(header)
         if match:
@@ -236,7 +268,8 @@ def _parse_header_mode(raw: Sequence[Sequence[str]]) -> Dict[str, Any]:
         if unknown_headers:
             _raise_header_error(f"Unknown extra headers are not allowed in wide mode: {sorted(unknown_headers)}")
         for slot, kinds in decoy_slots.items():
-            if sorted(kinds.keys()) != ["name", "sequence"]:
+            required_kinds = {"name", "sequence"}
+            if not required_kinds.issubset(kinds.keys()):
                 _raise_header_error(
                     f"Decoy slot '{slot}' must provide both name and sequence headers; found {sorted(kinds.keys())}"
                 )
@@ -251,13 +284,15 @@ def _parse_header_mode(raw: Sequence[Sequence[str]]) -> Dict[str, Any]:
             )
         input_mode = "wide"
     else:
-        if set(headers) != _CANONICAL_HEADER_SET:
-            if unknown_headers:
-                _raise_header_error(
-                    f"Unknown extra headers are not allowed in headered canonical pair mode: {sorted(unknown_headers)}"
-                )
+        header_set = set(headers)
+        missing_required = sorted(_CANONICAL_HEADER_SET - header_set)
+        allowed_headers = _CANONICAL_HEADER_SET | _OPTIONAL_TEMPLATE_HEADER_SET
+        unknown_headers = sorted(header for header in headers_raw if header.lower() not in allowed_headers)
+        if missing_required:
+            _raise_header_error(f"Headered canonical pair mode is missing required columns: {missing_required}")
+        if unknown_headers:
             _raise_header_error(
-                "Headered canonical pair mode requires exactly the canonical 4 column names."
+                f"Unknown extra headers are not allowed in headered canonical pair mode: {unknown_headers}"
             )
         input_mode = "canonical_pair"
 
@@ -305,6 +340,8 @@ def _parse_header_mode(raw: Sequence[Sequence[str]]) -> Dict[str, Any]:
                 partner_slot="target",
                 partner_name=source_row["target_name"],
                 partner_seq=source_row["target_seq"],
+                partner_template_path=str(source_row.get("target_template_path", "") or ""),
+                partner_template_chain_id=str(source_row.get("target_template_chain_id", "") or ""),
             )
         )
 
@@ -320,9 +357,15 @@ def _parse_header_mode(raw: Sequence[Sequence[str]]) -> Dict[str, Any]:
             seq_header = decoy_slots[slot]["sequence"]
             decoy_name = str(row_values.get(name_header, "")).strip()
             decoy_seq = str(row_values.get(seq_header, "")).strip()
+            decoy_template_path = str(row_values.get(decoy_slots[slot].get("template_path", ""), "")).strip()
+            decoy_template_chain_id = str(row_values.get(decoy_slots[slot].get("template_chain_id", ""), "")).strip()
             if bool(decoy_name) != bool(decoy_seq):
                 raise ValueError(
                     f"Line {line_number}: slot {slot!r} must provide both name and sequence or neither."
+                )
+            if (decoy_template_path or decoy_template_chain_id) and not (decoy_name and decoy_seq):
+                raise ValueError(
+                    f"Line {line_number}: slot {slot!r} template fields require both name and sequence."
                 )
             if not decoy_name and not decoy_seq:
                 continue
@@ -333,6 +376,8 @@ def _parse_header_mode(raw: Sequence[Sequence[str]]) -> Dict[str, Any]:
                     partner_slot=slot,
                     partner_name=decoy_name,
                     partner_seq=decoy_seq,
+                    partner_template_path=decoy_template_path,
+                    partner_template_chain_id=decoy_template_chain_id,
                 )
             )
 

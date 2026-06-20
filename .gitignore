@@ -37,3 +37,11 @@ plans/
 docs/
 *.csv
 tests/
+tests/*
+data/
+data/*
+
+# Keep structural-template example inputs trackable despite the broad CSV ignore.
+!templates/
+!templates/examples/
+!templates/examples/**/*.csv

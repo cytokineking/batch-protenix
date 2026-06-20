@@ -17,6 +17,7 @@ MSA policy:
 import csv
 import datetime
 import atexit
+import base64
 import hashlib
 import importlib
 import json
@@ -140,7 +141,7 @@ PROTENIX_GIT_URL = os.environ.get(
     "PROTENIX_GIT_URL", "https://github.com/cytokineking/Protenix.git"
 )
 PROTENIX_GIT_REF = os.environ.get(
-    "PROTENIX_GIT_REF", "8c93234e0b53cc1ceeecb3fb8cd9d58fb7803d78"
+    "PROTENIX_GIT_REF", "main"
 )
 MMSEQS2_GIT_URL = os.environ.get("MMSEQS2_GIT_URL", "https://github.com/soedinglab/MMseqs2.git")
 MMSEQS2_GIT_REF = os.environ.get("MMSEQS2_GIT_REF", "01683a607f83878e95436632d73e1d7d9ae30955")
@@ -198,6 +199,7 @@ image = (
         f"cd /root/MMseqs2 && git checkout {shlex.quote(MMSEQS2_GIT_REF)}",
     )
     .add_local_file("ipsae.py", "/root/ipsae.py", copy=True)
+    .add_local_file("modal_protenix_batch.py", "/root/modal_protenix_batch.py", copy=True)
     .add_local_file("pair_csv_utils.py", "/root/pair_csv_utils.py", copy=True)
     .add_local_file("vhh_msa_templates.py", "/root/vhh_msa_templates.py", copy=True)
 )
@@ -925,6 +927,26 @@ def _manifest_hash(task_rows: Sequence[Dict[str, Any]], critical_flags: Dict[str
                 "binder_seq": _normalize_sequence(str(r.get("binder_seq", ""))),
                 "target_name": r["target_name"],
                 "target_seq": _normalize_sequence(str(r.get("target_seq", ""))),
+                "binder_template_sha256": (r.get("binder_template_ref") or {}).get("sha256")
+                if isinstance(r.get("binder_template_ref"), dict)
+                else "",
+                "binder_template_source": (r.get("binder_template_ref") or {}).get("source")
+                if isinstance(r.get("binder_template_ref"), dict)
+                else "",
+                "binder_template_input_chain_id": "A" if isinstance(r.get("binder_template_ref"), dict) else "",
+                "binder_template_chain_id": (r.get("binder_template_ref") or {}).get("template_chain_id")
+                if isinstance(r.get("binder_template_ref"), dict)
+                else "",
+                "partner_template_sha256": (r.get("partner_template_ref") or {}).get("sha256")
+                if isinstance(r.get("partner_template_ref"), dict)
+                else "",
+                "partner_template_source": (r.get("partner_template_ref") or {}).get("source")
+                if isinstance(r.get("partner_template_ref"), dict)
+                else "",
+                "partner_template_input_chain_id": "B" if isinstance(r.get("partner_template_ref"), dict) else "",
+                "partner_template_chain_id": (r.get("partner_template_ref") or {}).get("template_chain_id")
+                if isinstance(r.get("partner_template_ref"), dict)
+                else "",
             }
             for r in task_rows
         ],
@@ -1014,6 +1036,95 @@ def _target_msa_lookup(
         f"name:{_sanitize_name(target_name)}",
     ]
     for key in keys:
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
+def _template_lookup_keys(name: str, seq: str) -> List[str]:
+    name_raw = str(name or "").strip()
+    name_n = _sanitize_name(name_raw) if name_raw else ""
+    seq_n = _normalize_sequence(seq)
+    keys: List[str] = []
+    if name_n and seq_n:
+        keys.append(f"name_seq:{name_n}|{seq_n}")
+    if seq_n:
+        keys.append(f"seq:{seq_n}")
+    if name_n:
+        keys.append(f"name:{name_n}")
+    return keys
+
+
+def _parse_template_map_csv(path: Path, *, role_label: str) -> Dict[str, Dict[str, str]]:
+    """
+    Parse binder or target-like partner template maps.
+
+    Accepted columns:
+    - binder_name/target_name/name/binder/target
+    - binder_sequence/target_sequence/sequence
+    - template_path/path/cif/cif_path/mmcif_path/pdb/pdb_path
+    - template_chain_id/chain_id/template_id
+    """
+    mapping: Dict[str, Dict[str, str]] = {}
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for line_no, row in enumerate(reader, start=2):
+            row_l = {k.strip().lower(): (v or "").strip() for k, v in row.items() if k}
+            name = (
+                row_l.get(f"{role_label}_name")
+                or row_l.get("name")
+                or row_l.get(role_label)
+                or row_l.get("target_name")
+                or row_l.get("binder_name")
+            )
+            seq = _normalize_sequence(
+                row_l.get(f"{role_label}_sequence")
+                or row_l.get("sequence")
+                or row_l.get("target_sequence")
+                or row_l.get("binder_sequence")
+                or ""
+            )
+            template_path = (
+                row_l.get("template_path")
+                or row_l.get("path")
+                or row_l.get("cif")
+                or row_l.get("cif_path")
+                or row_l.get("mmcif_path")
+                or row_l.get("pdb")
+                or row_l.get("pdb_path")
+                or ""
+            )
+            chain_id = (
+                row_l.get("template_chain_id")
+                or row_l.get("chain_id")
+                or row_l.get("template_id")
+                or DEFAULT_TEMPLATE_CHAIN_ID
+            )
+            if not template_path:
+                raise ValueError(f"{path}: line {line_no} is missing template_path")
+            if not name and not seq:
+                raise ValueError(f"{path}: line {line_no} must provide at least a name or sequence")
+            entry = {
+                "template_path": template_path,
+                "template_chain_id": chain_id or DEFAULT_TEMPLATE_CHAIN_ID,
+                "source_path": str(path),
+            }
+            for key in _template_lookup_keys(name or "", seq):
+                if key.endswith("|") or key in {"seq:", "name:"}:
+                    continue
+                existing = mapping.get(key)
+                if existing is not None and existing != entry:
+                    raise ValueError(f"{path}: ambiguous duplicate template map key {key!r}")
+                mapping[key] = entry
+    return mapping
+
+
+def _template_map_lookup(
+    mapping: Dict[str, Dict[str, str]],
+    name: str,
+    seq: str,
+) -> Optional[Dict[str, str]]:
+    for key in _template_lookup_keys(name, seq):
         if key in mapping:
             return mapping[key]
     return None
@@ -1219,7 +1330,7 @@ def _ensure_protenix_runtime(
         raise RuntimeError("\n".join(msg))
 
 
-def _check_protenix_imports() -> Dict[str, str]:
+def _check_protenix_imports(require_template_support: bool = False) -> Dict[str, str]:
     """Return import errors for required runtime modules."""
     required_modules = [
         "esm",
@@ -1229,6 +1340,8 @@ def _check_protenix_imports() -> Dict[str, str]:
         "protenix.data.inference.infer_dataloader",
         "runner.inference",
     ]
+    if require_template_support:
+        required_modules.append("protenix.data.template.structural_template")
     errors: Dict[str, str] = {}
     for mod in required_modules:
         try:
@@ -1236,6 +1349,21 @@ def _check_protenix_imports() -> Dict[str, str]:
         except Exception as exc:  # noqa: BLE001
             errors[mod] = f"{type(exc).__name__}: {exc}"
     return errors
+
+
+def _resolved_protenix_git_sha() -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", "/root/Protenix", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.strip()
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
 
 
 # =============================================================================
@@ -2102,6 +2230,132 @@ def _msa_ref_from_fetch_info(info: Dict[str, Any]) -> Dict[str, Any]:
     raise RuntimeError(f"Unsupported MSA fetch status: {status}")
 
 
+ALLOWED_TEMPLATE_SUFFIXES = {".cif", ".mmcif", ".pdb"}
+DEFAULT_TEMPLATE_CHAIN_ID = "A"
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _resolve_local_template_path(path_text: str, *, base_path: Optional[Path] = None) -> Path:
+    raw = str(path_text or "").strip()
+    if not raw:
+        raise ValueError("template path is empty")
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute() and candidate.exists():
+        return candidate
+    if not candidate.is_absolute() and base_path is not None:
+        base_dir = base_path if base_path.is_dir() else base_path.parent
+        by_base = (base_dir / candidate).expanduser()
+        if by_base.exists():
+            return by_base.resolve()
+    if candidate.exists():
+        return candidate.resolve()
+    raise FileNotFoundError(f"Template path does not exist: {raw}")
+
+
+def _template_payload_ref(
+    *,
+    path: Path,
+    role: str,
+    source: str,
+    template_chain_id: str = DEFAULT_TEMPLATE_CHAIN_ID,
+) -> Dict[str, Any]:
+    suffix = path.suffix.lower()
+    if suffix not in ALLOWED_TEMPLATE_SUFFIXES:
+        raise ValueError(f"Unsupported structural template format: {path}")
+    data = path.read_bytes()
+    if not data:
+        raise ValueError(f"Structural template file is empty: {path}")
+    chain_id = str(template_chain_id or DEFAULT_TEMPLATE_CHAIN_ID).strip() or DEFAULT_TEMPLATE_CHAIN_ID
+    return {
+        "source": str(source),
+        "role": str(role),
+        "original_path": str(path),
+        "path_basename": path.name,
+        "suffix": suffix,
+        "template_chain_id": chain_id,
+        "sha256": _sha256_bytes(data),
+        "size_bytes": len(data),
+        "content_b64": base64.b64encode(data).decode("ascii"),
+    }
+
+
+def _template_ref_public(ref: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not ref:
+        return {"present": False}
+    return {
+        "present": True,
+        "source": ref.get("source"),
+        "role": ref.get("role"),
+        "path_basename": ref.get("path_basename"),
+        "original_path": ref.get("original_path"),
+        "template_chain_id": ref.get("template_chain_id"),
+        "sha256": ref.get("sha256"),
+        "size_bytes": ref.get("size_bytes"),
+    }
+
+
+def _task_template_refs(task: Dict[str, Any]) -> List[Dict[str, Any]]:
+    refs: List[Dict[str, Any]] = []
+    binder_ref = task.get("binder_template_ref")
+    partner_ref = task.get("partner_template_ref")
+    if isinstance(binder_ref, dict) and binder_ref:
+        refs.append(binder_ref)
+    if isinstance(partner_ref, dict) and partner_ref:
+        refs.append(partner_ref)
+    return refs
+
+
+def _task_has_templates(task: Dict[str, Any]) -> bool:
+    return bool(_task_template_refs(task))
+
+
+def _task_template_summary(task: Dict[str, Any]) -> Dict[str, Any]:
+    binder_ref = task.get("binder_template_ref")
+    partner_ref = task.get("partner_template_ref")
+    return {
+        "use_template": bool(_task_has_templates(task)),
+        "binder": _template_ref_public(binder_ref if isinstance(binder_ref, dict) else None),
+        "partner": _template_ref_public(partner_ref if isinstance(partner_ref, dict) else None),
+    }
+
+
+def _materialize_template_ref(
+    *,
+    template_dir: Path,
+    sample_prefix: str,
+    ref: Dict[str, Any],
+    input_chain_id: str,
+    index: int,
+) -> Dict[str, Any]:
+    suffix = str(ref.get("suffix") or "").lower()
+    if suffix not in ALLOWED_TEMPLATE_SUFFIXES:
+        raise ValueError(f"Unsupported structural template format in task payload: {suffix}")
+    content_b64 = str(ref.get("content_b64") or "")
+    if not content_b64:
+        raise ValueError("Structural template task payload is missing content")
+    data = base64.b64decode(content_b64.encode("ascii"))
+    expected_sha = str(ref.get("sha256") or "")
+    actual_sha = _sha256_bytes(data)
+    if expected_sha and actual_sha != expected_sha:
+        raise ValueError(
+            f"Structural template payload SHA256 mismatch for {ref.get('path_basename')}: "
+            f"expected {expected_sha}, got {actual_sha}"
+        )
+    template_dir.mkdir(parents=True, exist_ok=True)
+    stem = _slugify(f"{sample_prefix}_{index}_{ref.get('role', 'template')}_{actual_sha[:10]}", max_len=90)
+    dest = template_dir / f"{stem}{suffix}"
+    dest.write_bytes(data)
+    payload_key = "pdb" if suffix == ".pdb" else "cif"
+    return {
+        payload_key: str(dest),
+        "chain_id": [str(input_chain_id)],
+        "template_id": [str(ref.get("template_chain_id") or DEFAULT_TEMPLATE_CHAIN_ID)],
+    }
+
+
 def _precompute_msas_impl(
     sequences: List[str],
     role: str,
@@ -2556,18 +2810,23 @@ def materialize_vhh_member_cache_entries_remote(
     max_containers=1,
     volumes={str(RUNTIME_ROOT): runtime_volume},
 )
-def preflight_protenix_runtime(model_name: str) -> Dict[str, Any]:
+def preflight_protenix_runtime(model_name: str, require_template_support: bool = False) -> Dict[str, Any]:
     """
     One-time preflight:
     - verify required Python dependencies import cleanly
     - verify checkpoint + common runtime assets are present on shared volume
     """
-    import_errors = _check_protenix_imports()
+    import_errors = _check_protenix_imports(require_template_support=bool(require_template_support))
     if import_errors:
         raise RuntimeError(f"Dependency preflight failed: {import_errors}")
 
     _ensure_protenix_runtime(model_name, populate_missing=False)
-    return {"status": "ok", "model_name": model_name}
+    return {
+        "status": "ok",
+        "model_name": model_name,
+        "require_template_support": bool(require_template_support),
+        "protenix_git_sha": _resolved_protenix_git_sha(),
+    }
 
 
 def _mmseqs_db_exists(prefix: Path) -> bool:
@@ -3132,6 +3391,15 @@ _PAIR_SUMMARY_HEADER = [
     "binder_seq",
     "target_name",
     "target_seq",
+    "use_template",
+    "binder_has_template",
+    "partner_has_template",
+    "binder_template_source",
+    "partner_template_source",
+    "binder_template_sha256",
+    "partner_template_sha256",
+    "binder_has_msa",
+    "partner_has_msa",
     "status",
     "best_sample_scope",
     "best_seed",
@@ -3417,6 +3685,19 @@ def _build_pair_summary_row(result: Dict[str, Any]) -> Dict[str, Any]:
             "binder_seq": result.get("binder_seq"),
             "target_name": result.get("target_name"),
             "target_seq": result.get("target_seq"),
+            "use_template": result.get("use_template"),
+            "binder_has_template": result.get("binder_has_template"),
+            "partner_has_template": result.get("partner_has_template"),
+            "binder_template_source": result.get("binder_template_source")
+            or ((result.get("template", {}) or {}).get("binder", {}) or {}).get("source"),
+            "partner_template_source": result.get("partner_template_source")
+            or ((result.get("template", {}) or {}).get("partner", {}) or {}).get("source"),
+            "binder_template_sha256": result.get("binder_template_sha256")
+            or ((result.get("template", {}) or {}).get("binder", {}) or {}).get("sha256"),
+            "partner_template_sha256": result.get("partner_template_sha256")
+            or ((result.get("template", {}) or {}).get("partner", {}) or {}).get("sha256"),
+            "binder_has_msa": result.get("binder_has_msa"),
+            "partner_has_msa": result.get("partner_has_msa"),
             "status": result.get("status"),
             "best_sample_scope": result.get("selection_scope"),
             "best_seed": result.get("best_seed"),
@@ -3488,6 +3769,24 @@ def _task_result_identity(task: Dict[str, Any], *, default_status: str, default_
         "selection_scope": task["best_sample_scope"],
         "attempt": int(task.get("attempt", 1)),
         "lease_epoch": int(task.get("lease_epoch", 0)),
+        "template": _task_template_summary(task),
+        "use_template": _task_has_templates(task),
+        "binder_has_template": bool(task.get("binder_template_ref")),
+        "partner_has_template": bool(task.get("partner_template_ref")),
+        "binder_template_source": (task.get("binder_template_ref") or {}).get("source")
+        if isinstance(task.get("binder_template_ref"), dict)
+        else "",
+        "partner_template_source": (task.get("partner_template_ref") or {}).get("source")
+        if isinstance(task.get("partner_template_ref"), dict)
+        else "",
+        "binder_template_sha256": (task.get("binder_template_ref") or {}).get("sha256")
+        if isinstance(task.get("binder_template_ref"), dict)
+        else "",
+        "partner_template_sha256": (task.get("partner_template_ref") or {}).get("sha256")
+        if isinstance(task.get("partner_template_ref"), dict)
+        else "",
+        "binder_has_msa": "",
+        "partner_has_msa": "",
         "error": default_error,
     }
 
@@ -3503,6 +3802,8 @@ def _build_protenix_input_json(
     binder_msa: Dict[str, Optional[str]],
     partner_msa: Dict[str, Optional[str]],
     input_dir: Path,
+    binder_template_ref: Optional[Dict[str, Any]] = None,
+    partner_template_ref: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Path, Dict[str, List[str]]]:
     input_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3523,6 +3824,7 @@ def _build_protenix_input_json(
 
     binder_chain = {
         "proteinChain": {
+            "id": ["A"],
             "sequence": _normalize_sequence(binder_seq),
             "count": 1,
         }
@@ -3534,6 +3836,7 @@ def _build_protenix_input_json(
 
     partner_chain = {
         "proteinChain": {
+            "id": ["B"],
             "sequence": _normalize_sequence(partner_seq),
             "count": 1,
         }
@@ -3543,7 +3846,26 @@ def _build_protenix_input_json(
     if partner_paths["unpairedMsaPath"]:
         partner_chain["proteinChain"]["unpairedMsaPath"] = partner_paths["unpairedMsaPath"]
 
-    payload = [{"name": sample_name, "sequences": [binder_chain, partner_chain]}]
+    sample: Dict[str, Any] = {"name": sample_name, "sequences": [binder_chain, partner_chain]}
+    template_refs = [
+        ("A", binder_template_ref),
+        ("B", partner_template_ref),
+    ]
+    templates = [
+        _materialize_template_ref(
+            template_dir=input_dir / "templates",
+            sample_prefix=sample_name,
+            ref=ref,
+            input_chain_id=chain_id,
+            index=index,
+        )
+        for index, (chain_id, ref) in enumerate(template_refs)
+        if isinstance(ref, dict) and ref
+    ]
+    if templates:
+        sample["templates"] = templates
+
+    payload = [sample]
     json_path = input_dir / "input.json"
     _save_json(json_path, payload)
 
@@ -3598,7 +3920,7 @@ def _build_protenix_batch_input_json(
         partner_paths = _write_msa_files(f"{prefix}_partner", partner_msa)
 
         binder_chain: Dict[str, Any] = {
-            "proteinChain": {"sequence": _normalize_sequence(task["binder_seq"]), "count": 1}
+            "proteinChain": {"id": ["A"], "sequence": _normalize_sequence(task["binder_seq"]), "count": 1}
         }
         if binder_paths["pairedMsaPath"]:
             binder_chain["proteinChain"]["pairedMsaPath"] = binder_paths["pairedMsaPath"]
@@ -3606,14 +3928,33 @@ def _build_protenix_batch_input_json(
             binder_chain["proteinChain"]["unpairedMsaPath"] = binder_paths["unpairedMsaPath"]
 
         partner_chain: Dict[str, Any] = {
-            "proteinChain": {"sequence": _normalize_sequence(task["partner_seq"]), "count": 1}
+            "proteinChain": {"id": ["B"], "sequence": _normalize_sequence(task["partner_seq"]), "count": 1}
         }
         if partner_paths["pairedMsaPath"]:
             partner_chain["proteinChain"]["pairedMsaPath"] = partner_paths["pairedMsaPath"]
         if partner_paths["unpairedMsaPath"]:
             partner_chain["proteinChain"]["unpairedMsaPath"] = partner_paths["unpairedMsaPath"]
 
-        samples.append({"name": sample_name, "sequences": [binder_chain, partner_chain]})
+        sample: Dict[str, Any] = {"name": sample_name, "sequences": [binder_chain, partner_chain]}
+        template_refs = [
+            ("A", task.get("binder_template_ref")),
+            ("B", task.get("partner_template_ref")),
+        ]
+        templates = [
+            _materialize_template_ref(
+                template_dir=input_dir / "templates",
+                sample_prefix=sample_name,
+                ref=ref,
+                input_chain_id=chain_id,
+                index=template_index,
+            )
+            for template_index, (chain_id, ref) in enumerate(template_refs)
+            if isinstance(ref, dict) and ref
+        ]
+        if templates:
+            sample["templates"] = templates
+
+        samples.append(sample)
 
     json_path = input_dir / "input.json"
     _save_json(json_path, samples)
@@ -3629,6 +3970,7 @@ def _build_protenix_inference_cmd(
     n_step: int,
     n_cycle: int,
     use_msa: bool,
+    use_template: bool = False,
 ) -> List[str]:
     return [
         "python",
@@ -3661,7 +4003,7 @@ def _build_protenix_inference_cmd(
         "--use_msa",
         str(use_msa).lower(),
         "--use_template",
-        "false",
+        str(use_template).lower(),
         "--use_rna_msa",
         "false",
     ]
@@ -4058,6 +4400,7 @@ def _run_protenix_task_impl(task: Dict[str, Any]) -> Dict[str, Any]:
         emit("msa_started", {"status": "running", "stage": "msa_prepare"})
         binder_msa = _load_msa_ref(task["binder_msa_ref"])
         partner_msa = _load_msa_ref(task["partner_msa_ref"])
+        task_has_templates = _task_has_templates(task)
         emit(
             "msa_done",
             {
@@ -4065,11 +4408,18 @@ def _run_protenix_task_impl(task: Dict[str, Any]) -> Dict[str, Any]:
                 "stage": "msa_prepare",
                 "binder_has_msa": bool(binder_msa.get("non_pairing")),
                 "partner_has_msa": bool(partner_msa.get("non_pairing")),
+                "use_template": task_has_templates,
+                "binder_has_template": bool(task.get("binder_template_ref")),
+                "partner_has_template": bool(task.get("partner_template_ref")),
             },
         )
 
         # If no target MSA is available for target role, hard fail.
-        if _partner_requires_target_like_msa(partner_role) and not partner_msa.get("non_pairing"):
+        if (
+            _partner_requires_target_like_msa(partner_role)
+            and bool(task.get("partner_msa_required", True))
+            and not partner_msa.get("non_pairing")
+        ):
             partner_ref = task.get("partner_msa_ref", {}) or {}
             source = str(partner_ref.get("source", "unknown"))
             cache_key = str(partner_ref.get("cache_key", ""))
@@ -4088,6 +4438,8 @@ def _run_protenix_task_impl(task: Dict[str, Any]) -> Dict[str, Any]:
             binder_msa=binder_msa,
             partner_msa=partner_msa,
             input_dir=input_dir,
+            binder_template_ref=task.get("binder_template_ref"),
+            partner_template_ref=task.get("partner_template_ref"),
         )
 
         out_dir = work_dir / "output"
@@ -4165,6 +4517,7 @@ def _run_protenix_task_impl(task: Dict[str, Any]) -> Dict[str, Any]:
             n_step=int(task["n_step"]),
             n_cycle=int(task["n_cycle"]),
             use_msa=bool(task["use_msa"]),
+            use_template=task_has_templates,
         )
         emit(
             "inference_started",
@@ -4268,6 +4621,12 @@ def _run_protenix_task_impl(task: Dict[str, Any]) -> Dict[str, Any]:
                     for c in per_seed_best
                 ],
                 "ipsae": ipsae_metrics,
+                "template": _task_template_summary(task),
+                "use_template": task_has_templates,
+                "binder_has_template": bool(task.get("binder_template_ref")),
+                "partner_has_template": bool(task.get("partner_template_ref")),
+                "binder_has_msa": bool(binder_msa.get("non_pairing")),
+                "partner_has_msa": bool(partner_msa.get("non_pairing")),
                 "input_json": _load_json(input_json),
                 "protenix_raw": {
                     "inference_stdout_tail": str(inference_result.get("stdout_tail", ""))[-20000:],
@@ -4341,7 +4700,7 @@ def _run_protenix_task_batch_impl(tasks: Sequence[Dict[str, Any]]) -> List[Dict[
     n_cycle = int(first["n_cycle"])
     best_scope = str(first["best_sample_scope"])
     task_timeout_s = int(first["task_timeout_s"])
-    use_msa = bool(first["use_msa"])
+    use_msa = any(bool(t.get("use_msa")) for t in tasks_list)
 
     work_dir = Path(tempfile.mkdtemp())
     try:
@@ -4353,7 +4712,11 @@ def _run_protenix_task_batch_impl(tasks: Sequence[Dict[str, Any]]) -> List[Dict[
             try:
                 binder_msa = _load_msa_ref(t["binder_msa_ref"])
                 partner_msa = _load_msa_ref(t["partner_msa_ref"])
-                if _partner_requires_target_like_msa(t.get("partner_role")) and not partner_msa.get("non_pairing"):
+                if (
+                    _partner_requires_target_like_msa(t.get("partner_role"))
+                    and bool(t.get("partner_msa_required", True))
+                    and not partner_msa.get("non_pairing")
+                ):
                     raise RuntimeError("Target-like partner MSA is required but missing for this task")
                 # Stash in the task dict to avoid reloading from cache when building JSON.
                 t["_binder_msa_inline"] = binder_msa
@@ -4383,6 +4746,7 @@ def _run_protenix_task_batch_impl(tasks: Sequence[Dict[str, Any]]) -> List[Dict[
             n_step=n_step,
             n_cycle=n_cycle,
             use_msa=use_msa,
+            use_template=any(_task_has_templates(t) for t in runnable),
         )
 
         inference_result = _run_protenix_inference_streaming(
@@ -4463,6 +4827,12 @@ def _run_protenix_task_batch_impl(tasks: Sequence[Dict[str, Any]]) -> List[Dict[
                             for c in per_seed_best
                         ],
                         "ipsae": ipsae_metrics,
+                        "template": _task_template_summary(t),
+                        "use_template": _task_has_templates(t),
+                        "binder_has_template": bool(t.get("binder_template_ref")),
+                        "partner_has_template": bool(t.get("partner_template_ref")),
+                        "binder_has_msa": bool((t.get("_binder_msa_inline") or {}).get("non_pairing")),
+                        "partner_has_msa": bool((t.get("_partner_msa_inline") or {}).get("non_pairing")),
                         "input_json": _load_json(input_json),
                         "protenix_raw": {
                             "inference_stdout_tail": str(inference_result.get("stdout_tail", ""))[-20000:],
@@ -4900,6 +5270,7 @@ def _save_task_result(
         "binder_seq": result.get("binder_seq"),
         "target_name": result.get("target_name"),
         "target_seq": result.get("target_seq"),
+        "template": result.get("template"),
     }
     _atomic_save_json(p["pair_json"], _to_jsonable(pair_payload))
     metrics_payload = dict(result)
@@ -4924,6 +5295,11 @@ def _save_task_result(
         "best_iptm": result.get("best_iptm"),
         "best_seed": result.get("best_seed"),
         "best_sample_rank": result.get("best_sample_rank"),
+        "use_template": result.get("use_template"),
+        "binder_has_template": result.get("binder_has_template"),
+        "partner_has_template": result.get("partner_has_template"),
+        "binder_has_msa": result.get("binder_has_msa"),
+        "partner_has_msa": result.get("partner_has_msa"),
     }
     _merge_status_file(p["status"], status_payload)
 
@@ -5767,8 +6143,13 @@ def run_pipeline(
     # Binder/target MSA controls
     binder_mode: str = "de_novo",  # de_novo | fixed_msa | full_msa
     binder_fixed_msa_dir: Optional[str] = None,
-    target_msa_source: str = "mmseqs",  # provided | mmseqs
+    target_msa_source: str = "mmseqs",  # none | provided | mmseqs | auto
     target_msa_map_csv: Optional[str] = None,
+    # Structural template controls
+    use_template: str = "auto",  # auto | true | false
+    binder_template_map_csv: Optional[str] = None,
+    target_template_map_csv: Optional[str] = None,
+    self_template_source: str = "binder",  # none | binder
     # Optional extra partner controls
     include_antitarget: bool = False,
     antitarget_csv: Optional[str] = None,
@@ -5891,8 +6272,16 @@ def run_pipeline(
         raise ValueError("--binder-mode must be one of: de_novo,fixed_msa,full_msa")
 
     target_msa_source_n = target_msa_source.strip().lower()
-    if target_msa_source_n not in {"provided", "mmseqs"}:
-        raise ValueError("--target-msa-source must be one of: provided,mmseqs")
+    if target_msa_source_n not in {"none", "provided", "mmseqs", "auto"}:
+        raise ValueError("--target-msa-source must be one of: none,provided,mmseqs,auto")
+
+    use_template_n = str(use_template).strip().lower()
+    if use_template_n not in {"auto", "true", "false"}:
+        raise ValueError("--use-template must be one of: auto,true,false")
+
+    self_template_source_n = str(self_template_source).strip().lower()
+    if self_template_source_n not in {"none", "binder"}:
+        raise ValueError("--self-template-source must be one of: none,binder")
 
     antitarget_msa_source_n = antitarget_msa_source.strip().lower()
     if antitarget_msa_source_n not in {"provided", "mmseqs", "none"}:
@@ -6030,6 +6419,76 @@ def run_pipeline(
         if not target_msa_map_csv:
             raise ValueError("--target-msa-map-csv is required when --target-msa-source provided")
         target_msa_map = _parse_target_msa_map_csv(Path(target_msa_map_csv))
+    elif target_msa_source_n == "auto" and target_msa_map_csv:
+        target_msa_map = _parse_target_msa_map_csv(Path(target_msa_map_csv))
+
+    binder_template_map: Dict[str, Dict[str, str]] = {}
+    target_template_map: Dict[str, Dict[str, str]] = {}
+    template_ref_cache: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+
+    if use_template_n != "false":
+        if binder_template_map_csv:
+            binder_template_map = _parse_template_map_csv(Path(binder_template_map_csv), role_label="binder")
+        if target_template_map_csv:
+            target_template_map = _parse_template_map_csv(Path(target_template_map_csv), role_label="target")
+
+    def build_template_ref(
+        *,
+        path_text: str,
+        template_chain_id: str,
+        role: str,
+        source: str,
+        base_path: Optional[Path] = None,
+    ) -> Dict[str, Any]:
+        resolved = _resolve_local_template_path(path_text, base_path=base_path or Path(pair_csv))
+        chain_id = str(template_chain_id or DEFAULT_TEMPLATE_CHAIN_ID).strip() or DEFAULT_TEMPLATE_CHAIN_ID
+        key = (str(resolved), chain_id, str(role), str(source))
+        ref = template_ref_cache.get(key)
+        if ref is None:
+            ref = _template_payload_ref(
+                path=resolved,
+                role=role,
+                source=source,
+                template_chain_id=chain_id,
+            )
+            template_ref_cache[key] = ref
+        return dict(ref)
+
+    def resolve_template_ref(
+        *,
+        row_path: str,
+        row_chain_id: str,
+        mapping: Dict[str, Dict[str, str]],
+        name: str,
+        seq: str,
+        role: str,
+        row_source: str,
+        map_source: str,
+    ) -> Optional[Dict[str, Any]]:
+        if use_template_n == "false":
+            return None
+        row_path = str(row_path or "").strip()
+        row_chain_id = str(row_chain_id or "").strip()
+        if row_chain_id and not row_path:
+            raise ValueError(f"{row_source} template chain ID was provided without a template path")
+        if row_path:
+            return build_template_ref(
+                path_text=row_path,
+                template_chain_id=row_chain_id or DEFAULT_TEMPLATE_CHAIN_ID,
+                role=role,
+                source=row_source,
+                base_path=Path(pair_csv),
+            )
+        mapped = _template_map_lookup(mapping, name, seq)
+        if mapped:
+            return build_template_ref(
+                path_text=str(mapped["template_path"]),
+                template_chain_id=str(mapped.get("template_chain_id") or DEFAULT_TEMPLATE_CHAIN_ID),
+                role=role,
+                source=map_source,
+                base_path=Path(str(mapped.get("source_path") or pair_csv)),
+            )
+        return None
 
     antitarget_msa_inline: Optional[Dict[str, Optional[str]]] = None
     antitarget_input_mode = "none"
@@ -6085,13 +6544,25 @@ def run_pipeline(
             }, None
         return None, dep_for("binder", seq)
 
-    def structured_partner_source(name: str, seq: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    def structured_partner_source(
+        name: str,
+        seq: str,
+        partner_template_ref: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str], bool]:
+        if target_msa_source_n == "none":
+            return {"source": "none"}, None, False
         if target_msa_source_n == "provided":
             pair = _target_msa_lookup(target_msa_map, name, seq)
             if not pair or not pair.get("non_pairing"):
                 raise RuntimeError(f"No provided target-like partner MSA found for partner '{name}'")
-            return {"source": "inline", "pairing": pair.get("pairing"), "non_pairing": pair.get("non_pairing")}, None
-        return None, dep_for("partner", seq)
+            return {"source": "inline", "pairing": pair.get("pairing"), "non_pairing": pair.get("non_pairing")}, None, True
+        if target_msa_source_n == "auto":
+            pair = _target_msa_lookup(target_msa_map, name, seq) if target_msa_map else None
+            if pair and pair.get("non_pairing"):
+                return {"source": "inline", "pairing": pair.get("pairing"), "non_pairing": pair.get("non_pairing")}, None, True
+            if partner_template_ref is not None:
+                return {"source": "none"}, None, False
+        return None, dep_for("partner", seq), True
 
     def antitarget_source() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         if antitarget_msa_source_n == "none":
@@ -6111,6 +6582,16 @@ def run_pipeline(
     task_list: List[Dict[str, Any]] = []
     for row in source_rows:
         binder_static, binder_dep = binder_source(row["binder_seq"])
+        binder_template_ref = resolve_template_ref(
+            row_path=str(row.get("binder_template_path", "") or ""),
+            row_chain_id=str(row.get("binder_template_chain_id", "") or ""),
+            mapping=binder_template_map,
+            name=str(row["binder_name"]),
+            seq=str(row["binder_seq"]),
+            role="binder",
+            row_source="row:binder",
+            map_source="binder_map",
+        )
 
         base_hash = _short_hash(f"{row['binder_name']}|{row['target_name']}|{row['row_index']}")
         pair_id = (
@@ -6125,9 +6606,24 @@ def run_pipeline(
             partner_seq: str,
             partner_static: Optional[Dict[str, Any]],
             partner_dep: Optional[str],
+            partner_msa_required: bool,
+            binder_template_ref: Optional[Dict[str, Any]],
+            partner_template_ref: Optional[Dict[str, Any]],
         ) -> None:
             task_id = f"{pair_id}__{slot}"
             deps = [x for x in [binder_dep, partner_dep] if x]
+            use_msa_for_task = bool(
+                binder_dep
+                or partner_dep
+                or (
+                    isinstance(binder_static, dict)
+                    and (binder_static.get("pairing") or binder_static.get("non_pairing"))
+                )
+                or (
+                    isinstance(partner_static, dict)
+                    and (partner_static.get("pairing") or partner_static.get("non_pairing"))
+                )
+            )
             task_list.append(
                 {
                     "task_id": task_id,
@@ -6144,6 +6640,9 @@ def run_pipeline(
                     "target_seq": row["target_seq"],
                     "binder_msa_ref_static": binder_static,
                     "partner_msa_ref_static": partner_static,
+                    "binder_template_ref": binder_template_ref,
+                    "partner_template_ref": partner_template_ref,
+                    "partner_msa_required": bool(partner_msa_required),
                     "binder_dep_key": binder_dep,
                     "partner_dep_key": partner_dep,
                     "pending_dep_keys": deps,
@@ -6153,7 +6652,7 @@ def run_pipeline(
                     "n_step": sample_diffusion_n_step,
                     "n_cycle": n_cycle,
                     "best_sample_scope": scope_n,
-                    "use_msa": True,
+                    "use_msa": use_msa_for_task,
                     "task_timeout_s": task_timeout_s,
                     "pae_cutoff": pae_cutoff,
                     "dist_cutoff": dist_cutoff,
@@ -6179,9 +6678,20 @@ def run_pipeline(
                 f"No canonical partner rows were found for comparison_group_id={row['comparison_group_id']}"
             )
         for main_partner in group_rows:
-            partner_static, partner_dep = structured_partner_source(
+            partner_template_ref = resolve_template_ref(
+                row_path=str(main_partner.get("partner_template_path", "") or ""),
+                row_chain_id=str(main_partner.get("partner_template_chain_id", "") or ""),
+                mapping=target_template_map,
+                name=str(main_partner["partner_name"]),
+                seq=str(main_partner["partner_seq"]),
+                role="partner",
+                row_source=f"row:{main_partner.get('partner_slot', main_partner.get('partner_role', 'partner'))}",
+                map_source="target_template_map",
+            )
+            partner_static, partner_dep, partner_msa_required = structured_partner_source(
                 str(main_partner["partner_name"]),
                 str(main_partner["partner_seq"]),
+                partner_template_ref,
             )
             add_task(
                 str(main_partner["partner_role"]),
@@ -6190,14 +6700,65 @@ def run_pipeline(
                 str(main_partner["partner_seq"]),
                 partner_static,
                 partner_dep,
+                partner_msa_required,
+                binder_template_ref,
+                partner_template_ref,
             )
 
         if include_antitarget:
+            anti_template_ref = resolve_template_ref(
+                row_path="",
+                row_chain_id="",
+                mapping=target_template_map,
+                name=str(antitarget_name),
+                seq=str(antitarget_seq),
+                role="partner",
+                row_source="row:antitarget",
+                map_source="target_template_map",
+            )
             anti_static, anti_dep = antitarget_source()
-            add_task("antitarget", "antitarget", antitarget_name, antitarget_seq, anti_static, anti_dep)
+            anti_msa_required = antitarget_msa_source_n != "none"
+            add_task(
+                "antitarget",
+                "antitarget",
+                antitarget_name,
+                antitarget_seq,
+                anti_static,
+                anti_dep,
+                anti_msa_required,
+                binder_template_ref,
+                anti_template_ref,
+            )
 
         if include_self:
-            add_task("self", "self", row["binder_name"], row["binder_seq"], {"source": "none"}, None)
+            self_partner_template_ref = (
+                dict(binder_template_ref)
+                if self_template_source_n == "binder" and binder_template_ref is not None
+                else None
+            )
+            if self_partner_template_ref is not None:
+                self_partner_template_ref["role"] = "partner"
+                self_partner_template_ref["source"] = "self:binder"
+            add_task(
+                "self",
+                "self",
+                row["binder_name"],
+                row["binder_seq"],
+                {"source": "none"},
+                None,
+                False,
+                binder_template_ref,
+                self_partner_template_ref,
+            )
+
+    if use_template_n == "true":
+        missing_template_tasks = [str(task["task_id"]) for task in task_list if not _task_has_templates(task)]
+        if missing_template_tasks:
+            preview = ", ".join(missing_template_tasks[:5])
+            raise ValueError(
+                "--use-template true requires at least one structural template for every task. "
+                f"Missing template task(s): {preview}"
+            )
 
     meta_path = output_root / "run_metadata.json"
     prior_meta: Optional[Dict[str, Any]] = None
@@ -6220,6 +6781,10 @@ def run_pipeline(
         "csv_limit": int(csv_limit),
         "binder_mode": binder_mode_n,
         "target_msa_source": target_msa_source_n,
+        "use_template": use_template_n,
+        "binder_template_map_csv": str(binder_template_map_csv or ""),
+        "target_template_map_csv": str(target_template_map_csv or ""),
+        "self_template_source": self_template_source_n,
         "include_antitarget": bool(include_antitarget),
         "antitarget_msa_source": antitarget_msa_source_n,
         "include_self": bool(include_self),
@@ -6262,6 +6827,13 @@ def run_pipeline(
     _log(f"MSA deps: {len(dep_requests)} unique")
     _log(f"Binder mode: {binder_mode_n}")
     _log(f"Target MSA source: {target_msa_source_n}")
+    _log(f"Template mode: {use_template_n}")
+    _log(
+        "Templates: "
+        f"binder_tasks={sum(1 for task in task_list if task.get('binder_template_ref'))} "
+        f"partner_tasks={sum(1 for task in task_list if task.get('partner_template_ref'))} "
+        f"unique_files={len({ref.get('sha256') for task in task_list for ref in _task_template_refs(task)})}"
+    )
     _log(f"MSA mode: {mmseqs_mode_n}")
     if host_url:
         _log(f"MSA host: {host_url}")
@@ -6291,7 +6863,8 @@ def run_pipeline(
     _log("=" * 78 + "\n")
 
     _log("Running dependency/runtime preflight...")
-    preflight = preflight_protenix_runtime.remote(model_name)
+    require_template_support = use_template_n == "true" or any(_task_has_templates(task) for task in task_list)
+    preflight = preflight_protenix_runtime.remote(model_name, require_template_support)
     _log(f"Preflight: {preflight}")
 
     configured_fn = GPU_FUNCTIONS[gpu]
@@ -6982,6 +7555,19 @@ def run_pipeline(
         run_status = "complete_success"
     if run_status == "complete_success" and str(auto_analysis.get("analysis_status")) in {"error", "complete_with_errors"}:
         run_status = "complete_with_errors"
+    unique_template_shas = {
+        str(ref.get("sha256"))
+        for task in task_list
+        for ref in _task_template_refs(task)
+        if ref.get("sha256")
+    }
+    template_summary = {
+        "mode": use_template_n,
+        "tasks_with_binder_template": sum(1 for task in task_list if task.get("binder_template_ref")),
+        "tasks_with_partner_template": sum(1 for task in task_list if task.get("partner_template_ref")),
+        "unique_template_files": len(unique_template_shas),
+        "unique_template_sha256": sorted(unique_template_shas),
+    }
     metadata = {
         "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
         "run_id": effective_run_id,
@@ -7002,6 +7588,11 @@ def run_pipeline(
         "resume_manifest_override": bool(resume_manifest_override),
         "binder_mode": binder_mode_n,
         "target_msa_source": target_msa_source_n,
+        "use_template": use_template_n,
+        "binder_template_map_csv": str(binder_template_map_csv or ""),
+        "target_template_map_csv": str(target_template_map_csv or ""),
+        "self_template_source": self_template_source_n,
+        "template_summary": template_summary,
         "include_antitarget": bool(include_antitarget),
         "include_self": bool(include_self),
         "mmseqs_mode": mmseqs_mode_n,
@@ -7030,6 +7621,7 @@ def run_pipeline(
         "msa_global_rate_key": str(msa_global_rate_key),
         "msa_max_inflight": int(msa_max_inflight),
         "model_name": model_name,
+        "protenix_git_sha": str((preflight or {}).get("protenix_git_sha") or ""),
         "seeds": seeds,
         "sample_diffusion_n_sample": sample_diffusion_n_sample,
         "sample_diffusion_n_step": sample_diffusion_n_step,

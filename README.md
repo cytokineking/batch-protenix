@@ -187,7 +187,41 @@ modal run modal_protenix_batch.py::run_pipeline \
   --mmseqs-host-url https://api.colabfold.com
 ```
 
-### 3) Local MMseqs GPU backend (optional)
+### 3) Structural templates with and without MSAs
+
+Templates are passed independently from MSAs, so you can compare template-only,
+MSA-only, and template-plus-MSA runs. Put per-row template paths directly in the
+pair CSV, or reuse templates with `--binder-template-map-csv` and
+`--target-template-map-csv`.
+
+Template-only target comparison:
+
+```bash
+modal run modal_protenix_batch.py::run_pipeline \
+  --pair-csv ./pairs_with_templates.csv \
+  --output-dir ./results_template_only \
+  --binder-mode de_novo \
+  --target-msa-source none \
+  --use-template true
+```
+
+Template plus target MSAs:
+
+```bash
+modal run modal_protenix_batch.py::run_pipeline \
+  --pair-csv ./pairs_with_templates.csv \
+  --output-dir ./results_template_msa \
+  --binder-mode de_novo \
+  --target-msa-source mmseqs \
+  --use-template true \
+  --mmseqs-mode colabfold \
+  --mmseqs-host-url https://api.colabfold.com
+```
+
+`templates/examples/` contains VHH and scFv framework-only CIF examples. Most
+production runs should still pass campaign-specific binder templates by path.
+
+### 4) Local MMseqs GPU backend (optional)
 
 Initialize local UniRef100 MMseqs DB once (quick path):
 
@@ -250,7 +284,7 @@ modal run modal_protenix_batch.py::run_pipeline \
 
 ### Target MSA controls
 
-- `--target-msa-source {provided,mmseqs}` (default: `mmseqs`)
+- `--target-msa-source {none,provided,mmseqs,auto}` (default: `mmseqs`)
 - `--target-msa-map-csv <path>` required when `target_msa_source=provided`
 
 Supported columns in target MSA map CSV:
@@ -261,6 +295,48 @@ Supported columns in target MSA map CSV:
 - or explicit `pairing_path` and `non_pairing_path`/`unpaired_msa_path`
 
 Lookup priority is: `(name + sequence)` -> `sequence` -> `name`.
+
+`target_msa_source=none` disables target-like partner MSAs. `auto` uses a
+provided target MSA map entry when available; otherwise, if a partner template
+is present, it runs template-only for that partner; if neither is present it
+falls back to MMseqs.
+
+### Structural template controls
+
+- `--use-template {auto,true,false}` (default: `auto`)
+- `--binder-template-map-csv <path>`
+- `--target-template-map-csv <path>`
+- `--self-template-source {none,binder}` (default: `binder`)
+
+`auto` enables Protenix templates for tasks with resolved template inputs and
+runs without templates for tasks that lack them. `true` fails before dispatch if
+any planned task has no structural template. `false` ignores template columns
+and maps and passes `--use_template false`.
+
+Headered pair CSVs may include these optional columns:
+
+- `binder_template_path`
+- `binder_template_chain_id`
+- `target_template_path`
+- `target_template_chain_id`
+
+Wide target/decoy CSVs may also include per-decoy template columns:
+
+- `decoy_template_path`, `decoy_template_chain_id`
+- `decoy2_template_path`, `decoy2_template_chain_id`
+- `decoy3_template_path`, `decoy3_template_chain_id`, and so on
+
+Template files are read by the local orchestrator and embedded in the Modal task
+payload, so paths only need to exist locally where `modal run` is launched.
+Supported file suffixes are `.cif`, `.mmcif`, and `.pdb`. The template chain ID
+defaults to `A`; binder templates are assigned to Protenix chain `A`, and target,
+decoy, antitarget, or self partner templates are assigned to chain `B`.
+
+Template map CSVs accept `template_path` plus optional `template_chain_id`.
+Binder maps can identify records by `binder_name`, `binder_sequence`, `name`, or
+`sequence`; target maps can use `target_name`, `target_sequence`, `name`, or
+`sequence`. Lookup priority is row-local template columns, then map
+`name+sequence`, then sequence, then name.
 
 ### Optional antitarget/self controls
 
@@ -593,6 +669,10 @@ Helpful flags:
 - `partner_role`, `partner_slot`, `partner_name`, `partner_seq`
 - `binder_name`, `binder_seq`
 - `target_name`, `target_seq`
+- `use_template`, `binder_has_template`, `partner_has_template`
+- `binder_template_source`, `partner_template_source`
+- `binder_template_sha256`, `partner_template_sha256`
+- `binder_has_msa`, `partner_has_msa`
 - `status`
 - `best_sample_scope`, `best_seed`, `best_sample_rank`, `n_candidates`, `n_interface_scored_candidates`
 - `best_iptm`, `iptm_mean`, `iptm_std`
@@ -620,7 +700,10 @@ Wide target/decoy runs also emit automatic analyses under `analyses/`, including
 
 ## Notes
 
-- Target MSA is enforced per target task.
+- Target MSA is enforced for target-like partner tasks only when the selected
+  target MSA source requires one.
+- Structural templates and MSAs are independent; a task can run with neither,
+  either, or both.
 - MSA fetching is dependency-gated and non-blocking: inference starts as soon as any task becomes ready.
 - Streaming artifacts and logs are written incrementally during task execution.
 - `run_metadata.json` includes `run_status` as one of: `complete_success`, `complete_with_errors`, `incomplete`.
